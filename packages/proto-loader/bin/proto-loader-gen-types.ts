@@ -448,10 +448,10 @@ function generateMessageInterfaces(formatter: TextFormatter, messageType: Protob
     }
   }
   if (usesLong) {
-    formatter.writeLine("import type { Long } from '@grpc/proto-loader';");
+    formatter.writeLine("import type { Long } from '@postman/proto-loader';");
   }
   if (messageType.fullName === '.google.protobuf.Any') {
-    formatter.writeLine("import type { AnyExtension } from '@grpc/proto-loader';")
+    formatter.writeLine("import type { AnyExtension } from '@postman/proto-loader';")
   }
   formatter.writeLine('');
   for (const childType of childTypes.sort(compareName)) {
@@ -663,7 +663,7 @@ function generateServiceInterfaces(formatter: TextFormatter, serviceType: Protob
     const grpcImportPath = options.grpcLib.startsWith('.') ? getPathToRoot(serviceType) + options.grpcLib : options.grpcLib;
     formatter.writeLine(`import type * as grpc from '${grpcImportPath}'`);
   }
-  formatter.writeLine(`import type { MethodDefinition } from '@grpc/proto-loader'`)
+  formatter.writeLine(`import type { MethodDefinition } from '@postman/proto-loader'`)
   const dependencies: Set<Protobuf.Type> = new Set<Protobuf.Type>();
   for (const method of serviceType.methodsArray) {
     dependencies.add(method.resolvedRequestType!);
@@ -709,7 +709,7 @@ function generateDefinitionImports(formatter: TextFormatter, namespace: Protobuf
   }
 
   if (imports.length) {
-    formatter.writeLine(`import type { ${imports.join(', ')} } from '@grpc/proto-loader';`);
+    formatter.writeLine(`import type { ${imports.join(', ')} } from '@postman/proto-loader';`);
   }
 }
 
