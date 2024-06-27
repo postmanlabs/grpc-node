@@ -1,6 +1,6 @@
 // Original file: proto/channelz.proto
 
-import type { Long } from '@grpc/proto-loader';
+import type { Long } from '@postman/proto-loader';
 
 /**
  * ChannelRef is a reference to a Channel.

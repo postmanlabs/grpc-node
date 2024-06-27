@@ -1,6 +1,6 @@
 // Original file: null
 
-import type { Long } from '@grpc/proto-loader';
+import type { Long } from '@postman/proto-loader';
 
 export interface Duration {
   'seconds'?: (number | string | Long);

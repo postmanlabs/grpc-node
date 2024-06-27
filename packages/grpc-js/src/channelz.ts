@@ -56,7 +56,7 @@ import {
   ChannelzHandlers,
 } from './generated/grpc/channelz/v1/Channelz';
 import { ProtoGrpcType as ChannelzProtoGrpcType } from './generated/channelz';
-import type { loadSync } from '@grpc/proto-loader';
+import type { loadSync } from '@postman/proto-loader';
 import { registerAdminService } from './admin';
 import { loadPackageDefinition } from './make-client';
 
@@ -869,9 +869,9 @@ export function getChannelzServiceDefinition(): ChannelzDefinition {
   if (loadedChannelzDefinition) {
     return loadedChannelzDefinition;
   }
-  /* The purpose of this complexity is to avoid loading @grpc/proto-loader at
+  /* The purpose of this complexity is to avoid loading @postman/proto-loader at
    * runtime for users who will not use/enable channelz. */
-  const loaderLoadSync = require('@grpc/proto-loader')
+  const loaderLoadSync = require('@postman/proto-loader')
     .loadSync as typeof loadSync;
   const loadedProto = loaderLoadSync('channelz.proto', {
     keepCase: true,

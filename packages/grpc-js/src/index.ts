@@ -209,13 +209,13 @@ export type Call =
 
 export const loadObject = (value: any, options: any): never => {
   throw new Error(
-    'Not available in this library. Use @grpc/proto-loader and loadPackageDefinition instead'
+    'Not available in this library. Use @postman/proto-loader and loadPackageDefinition instead'
   );
 };
 
 export const load = (filename: any, format: any, options: any): never => {
   throw new Error(
-    'Not available in this library. Use @grpc/proto-loader and loadPackageDefinition instead'
+    'Not available in this library. Use @postman/proto-loader and loadPackageDefinition instead'
   );
 };
 

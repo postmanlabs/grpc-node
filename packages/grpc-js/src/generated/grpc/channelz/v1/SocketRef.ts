@@ -1,6 +1,6 @@
 // Original file: proto/channelz.proto
 
-import type { Long } from '@grpc/proto-loader';
+import type { Long } from '@postman/proto-loader';
 
 /**
  * SocketRef is a reference to a Socket.

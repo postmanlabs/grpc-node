@@ -15,7 +15,7 @@
  *
  */
 
-import * as loader from '@grpc/proto-loader';
+import * as loader from '@postman/proto-loader';
 import * as assert2 from './assert2';
 import * as path from 'path';
 import * as grpc from '../src';

@@ -1,6 +1,6 @@
 // Original file: null
 
-import type { AnyExtension } from '@grpc/proto-loader';
+import type { AnyExtension } from '@postman/proto-loader';
 
 export type Any = AnyExtension | {
   type_url: string;

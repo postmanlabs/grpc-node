@@ -22,7 +22,7 @@ import * as fs from 'fs';
 import * as http2 from 'http2';
 import * as path from 'path';
 import * as net from 'net';
-import * as protoLoader from '@grpc/proto-loader';
+import * as protoLoader from '@postman/proto-loader';
 
 import * as grpc from '../src';
 import { Server, ServerCredentials } from '../src';
