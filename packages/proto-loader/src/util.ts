@@ -18,7 +18,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as Protobuf from 'protobufjs';
+import * as Protobuf from '@postman/protobufjs';
 
 function addIncludePathResolver(root: Protobuf.Root, includePaths: string[]) {
   const originalResolvePath = root.resolvePath;
@@ -89,10 +89,10 @@ export function addCommonProtos(): void {
   // and wrappers. compiler/plugin is excluded in Protobuf.js and here.
 
   // Using constant strings for compatibility with tools like Webpack
-  const apiDescriptor = require('protobufjs/google/protobuf/api.json');
-  const descriptorDescriptor = require('protobufjs/google/protobuf/descriptor.json');
-  const sourceContextDescriptor = require('protobufjs/google/protobuf/source_context.json');
-  const typeDescriptor = require('protobufjs/google/protobuf/type.json');
+  const apiDescriptor = require('@postman/protobufjs/google/protobuf/api.json');
+  const descriptorDescriptor = require('@postman/protobufjs/google/protobuf/descriptor.json');
+  const sourceContextDescriptor = require('@postman/protobufjs/google/protobuf/source_context.json');
+  const typeDescriptor = require('@postman/protobufjs/google/protobuf/type.json');
 
   Protobuf.common(
     'api',

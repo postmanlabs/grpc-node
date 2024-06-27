@@ -20,7 +20,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-import * as Protobuf from 'protobufjs';
+import * as Protobuf from '@postman/protobufjs';
 import * as yargs from 'yargs';
 
 import camelCase = require('lodash.camelcase');

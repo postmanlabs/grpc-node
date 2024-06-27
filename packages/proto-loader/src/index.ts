@@ -17,8 +17,8 @@
  */
 
 import camelCase = require('lodash.camelcase');
-import * as Protobuf from 'protobufjs';
-import * as descriptor from 'protobufjs/ext/descriptor';
+import * as Protobuf from '@postman/protobufjs';
+import * as descriptor from '@postman/protobufjs/ext/descriptor';
 
 import { loadProtosWithOptionsSync, loadProtosWithOptions, Options, addCommonProtos } from './util';
 
@@ -59,7 +59,7 @@ export function isAnyExtension(obj: object): obj is AnyExtension {
   return ('@type' in obj) && (typeof (obj as AnyExtension)['@type'] === 'string');
 }
 
-declare module 'protobufjs' {
+declare module '@postman/protobufjs' {
   interface Type {
     toDescriptor(
       protoVersion: string
