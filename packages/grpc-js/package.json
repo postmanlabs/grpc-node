@@ -67,7 +67,7 @@
     "generate-test-types": "proto-loader-gen-types --keepCase --longs String --enums String --defaults --oneofs --includeComments --include-dirs test/fixtures/ -O test/generated/ --grpcLib ../../src/index test_service.proto"
   },
   "dependencies": {
-    "@postman/proto-loader": "^0.7.13-postman.2",
+    "@postman/proto-loader": "^0.7.13-postman.3",
     "@js-sdsl/ordered-map": "^4.4.2"
   },
   "files": [
