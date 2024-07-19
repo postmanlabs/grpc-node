@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 gRPC authors.
+ * Copyright 2024 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,30 +15,5 @@
  *
  */
 
-syntax = "proto3";
-
-message Request {
-  bool error = 1;
-  string message = 2;
-  int32 errorAfter = 3;
-  int32 responseLength = 4;
-}
-
-message Response {
-  int32 count = 1;
-  string message = 2;
-}
-
-service TestService {
-  rpc Unary (Request) returns (Response) {
-  }
-
-  rpc ClientStream (stream Request) returns (Response) {
-  }
-
-  rpc ServerStream (Request) returns (stream Response) {
-  }
-
-  rpc BidiStream (stream Request) returns (stream Response) {
-  }
-}
+export const GRPC_NODE_USE_ALTERNATIVE_RESOLVER =
+  (process.env.GRPC_NODE_USE_ALTERNATIVE_RESOLVER ?? 'false') === 'true';
