@@ -1,6 +1,6 @@
 {
   "name": "@postman/proto-loader",
-  "version": "0.7.13-postman.2",
+  "version": "0.7.13-postman.3",
   "author": "Google Inc.",
   "contributors": [
     {
@@ -47,7 +47,7 @@
   "dependencies": {
     "lodash.camelcase": "^4.3.0",
     "long": "^5.0.0",
-    "@postman/protobufjs": "^7.3.2-postman.2",
+    "@postman/protobufjs": "^7.3.2-postman.3",
     "yargs": "^17.7.2"
   },
   "devDependencies": {
