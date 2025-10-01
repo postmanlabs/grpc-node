@@ -21,6 +21,10 @@ import * as mocha from 'gulp-mocha';
 import * as path from 'path';
 import * as execa from 'execa';
 import * as semver from 'semver';
+import { ncp } from 'ncp';
+import { promisify } from 'util';
+
+const ncpP = promisify(ncp);
 
 Error.stackTraceLimit = Infinity;
 
@@ -60,9 +64,14 @@ const cleanAll = gulp.parallel(clean);
  */
 const compile = checkTask(() => execNpmCommand('compile'));
 
+const copyTestFixtures = checkTask(() =>
+  ncpP(`${jsCoreDir}/test/fixtures`, `${outDir}/test/fixtures`)
+);
+
 const runTests = checkTask(() => {
-  process.env.GRPC_EXPERIMENTAL_XDS_FEDERATION = 'true';
   process.env.GRPC_EXPERIMENTAL_PICKFIRST_LB_CONFIG = 'true';
+  process.env.GRPC_XDS_EXPERIMENTAL_RBAC = 'true';
+  process.env.GRPC_EXPERIMENTAL_XDS_WRR_LB = 'true';
   if (Number(process.versions.node.split('.')[0]) <= 14) {
     process.env.GRPC_XDS_EXPERIMENTAL_ENABLE_RING_HASH = 'false';
   }
@@ -71,7 +80,7 @@ const runTests = checkTask(() => {
                  require: ['ts-node/register']}));
 });
 
-const test = gulp.series(install, runTests);
+const test = gulp.series(install, copyTestFixtures, runTests);
 
 export {
   install,

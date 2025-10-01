@@ -24,12 +24,14 @@ import { Route } from "../src/generated/envoy/config/route/v3/Route";
 import { Listener } from "../src/generated/envoy/config/listener/v3/Listener";
 import { HttpConnectionManager } from "../src/generated/envoy/extensions/filters/network/http_connection_manager/v3/HttpConnectionManager";
 import { AnyExtension } from "@grpc/proto-loader";
-import { CLUSTER_CONFIG_TYPE_URL, HTTP_CONNECTION_MANGER_TYPE_URL } from "../src/resources";
+import { CLUSTER_CONFIG_TYPE_URL, HTTP_CONNECTION_MANGER_TYPE_URL, UPSTREAM_TLS_CONTEXT_TYPE_URL } from "../src/resources";
 import { LocalityLbEndpoints } from "../src/generated/envoy/config/endpoint/v3/LocalityLbEndpoints";
 import { LbEndpoint } from "../src/generated/envoy/config/endpoint/v3/LbEndpoint";
 import { ClusterConfig } from "../src/generated/envoy/extensions/clusters/aggregate/v3/ClusterConfig";
 import { Any } from "../src/generated/google/protobuf/Any";
 import { ControlPlaneServer } from "./xds-server";
+import { UpstreamTlsContext } from "../src/generated/envoy/extensions/transport_sockets/tls/v3/UpstreamTlsContext";
+import { HttpFilter } from "../src/generated/envoy/extensions/filters/network/http_connection_manager/v3/HttpFilter";
 
 interface Endpoint {
   locality: Locality;
@@ -71,7 +73,13 @@ export interface FakeCluster {
 }
 
 export class FakeEdsCluster implements FakeCluster {
-  constructor(private clusterName: string, private endpointName: string, private endpoints: Endpoint[], private loadBalancingPolicyOverride?: Any | 'RING_HASH') {}
+  constructor(
+    private clusterName: string,
+    private endpointName: string,
+    private endpoints: Endpoint[],
+    private loadBalancingPolicyOverride?: Any | 'RING_HASH' | undefined,
+    private upstreamTlsContext?: UpstreamTlsContext
+  ) {}
 
   getEndpointConfig(): ClusterLoadAssignment {
     return {
@@ -110,6 +118,14 @@ export class FakeEdsCluster implements FakeCluster {
       }
     } else {
       result.lb_policy = 'ROUND_ROBIN';
+    }
+    if (this.upstreamTlsContext) {
+      result.transport_socket = {
+        typed_config: {
+          '@type': UPSTREAM_TLS_CONTEXT_TYPE_URL,
+          ...this.upstreamTlsContext
+        }
+      }
     }
     return result;
   }
@@ -385,8 +401,8 @@ const DEFAULT_BASE_SERVER_ROUTE_CONFIG: RouteConfiguration = {
 export class FakeServerRoute {
   private listener: Listener;
   private routeConfiguration: RouteConfiguration;
-  constructor(port: number, routeName: string, baseListener?: Listener | undefined, baseRouteConfiguration?: RouteConfiguration) {
-    this.listener = baseListener ?? DEFAULT_BASE_SERVER_LISTENER;
+  constructor(port: number, routeName: string, baseListener?: Listener | undefined, baseRouteConfiguration?: RouteConfiguration | undefined, httpFilters?: HttpFilter[]) {
+    this.listener = baseListener ?? {...DEFAULT_BASE_SERVER_LISTENER};
     this.listener.name = `[::1]:${port}`;
     this.listener.address = {
       socket_address: {
@@ -399,11 +415,9 @@ export class FakeServerRoute {
       rds: {
         route_config_name: routeName,
         config_source: {ads: {}}
-      }
+      },
+      http_filters: httpFilters ?? []
     };
-    this.listener.api_listener = {
-      api_listener: httpConnectionManager
-    }
     const filterList = [{
       typed_config: httpConnectionManager
     }];
@@ -414,7 +428,7 @@ export class FakeServerRoute {
       filterChain.filters = filterList;
     }
 
-    this.routeConfiguration = baseRouteConfiguration ?? DEFAULT_BASE_SERVER_ROUTE_CONFIG;
+    this.routeConfiguration = baseRouteConfiguration ?? {...DEFAULT_BASE_SERVER_ROUTE_CONFIG};
     this.routeConfiguration.name = routeName;
   }
 

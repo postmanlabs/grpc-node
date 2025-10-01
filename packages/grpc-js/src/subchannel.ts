@@ -15,7 +15,7 @@
  *
  */
 
-import { ChannelCredentials } from './channel-credentials';
+import { ChannelCredentials, SecureConnector } from './channel-credentials';
 import { Metadata } from './metadata';
 import { ChannelOptions } from './channel-options';
 import { ConnectivityState } from './connectivity-state';
@@ -41,11 +41,15 @@ import {
 } from './channelz';
 import {
   ConnectivityStateListener,
+  DataWatcher,
   SubchannelInterface,
 } from './subchannel-interface';
 import { SubchannelCallInterceptingListener } from './subchannel-call';
 import { SubchannelCall } from './subchannel-call';
 import { CallEventTracker, SubchannelConnector, Transport } from './transport';
+import { CallCredentials } from './call-credentials';
+import { SingleSubchannelChannel } from './single-subchannel-channel';
+import { Channel } from './channel';
 
 const TRACER_NAME = 'subchannel';
 
@@ -54,7 +58,12 @@ const TRACER_NAME = 'subchannel';
  * to calculate it */
 const KEEPALIVE_MAX_TIME_MS = ~(1 << 31);
 
-export class Subchannel {
+export interface DataProducer {
+  addDataWatcher(dataWatcher: DataWatcher): void;
+  removeDataWatcher(dataWatcher: DataWatcher): void;
+}
+
+export class Subchannel implements SubchannelInterface {
   /**
    * The subchannel's current connectivity state. Invariant: `session` === `null`
    * if and only if `connectivityState` is IDLE or TRANSIENT_FAILURE.
@@ -102,6 +111,12 @@ export class Subchannel {
   // Channelz socket info
   private streamTracker: ChannelzCallTracker | ChannelzCallTrackerStub;
 
+  private secureConnector: SecureConnector;
+
+  private dataProducers: Map<string, DataProducer> = new Map();
+
+  private subchannelChannel: Channel | null = null;
+
   /**
    * A class representing a connection to a single backend.
    * @param channelTarget The target string for the channel as a whole
@@ -116,7 +131,7 @@ export class Subchannel {
     private channelTarget: GrpcUri,
     private subchannelAddress: SubchannelAddress,
     private options: ChannelOptions,
-    private credentials: ChannelCredentials,
+    credentials: ChannelCredentials,
     private connector: SubchannelConnector
   ) {
     const backoffOptions: BackoffOptions = {
@@ -155,6 +170,7 @@ export class Subchannel {
       'Subchannel constructed with options ' +
         JSON.stringify(options, undefined, 2)
     );
+    this.secureConnector = credentials._createSecureConnector(channelTarget, options);
   }
 
   private getChannelzInfo(): SubchannelInfo {
@@ -229,7 +245,7 @@ export class Subchannel {
       options = { ...options, 'grpc.keepalive_time_ms': adjustedKeepaliveTime };
     }
     this.connector
-      .connect(this.subchannelAddress, this.credentials, options)
+      .connect(this.subchannelAddress, this.secureConnector, options)
       .then(
         transport => {
           if (
@@ -290,11 +306,21 @@ export class Subchannel {
     if (oldStates.indexOf(this.connectivityState) === -1) {
       return false;
     }
-    this.trace(
-      ConnectivityState[this.connectivityState] +
-        ' -> ' +
-        ConnectivityState[newState]
-    );
+    if (errorMessage) {
+      this.trace(
+        ConnectivityState[this.connectivityState] +
+          ' -> ' +
+          ConnectivityState[newState] +
+          ' with error "' + errorMessage + '"'
+      );
+
+    } else {
+      this.trace(
+        ConnectivityState[this.connectivityState] +
+          ' -> ' +
+          ConnectivityState[newState]
+      );
+    }
     if (this.channelzEnabled) {
       this.channelzTrace.addTrace(
         'CT_INFO',
@@ -354,6 +380,7 @@ export class Subchannel {
     if (this.refcount === 0) {
       this.channelzTrace.addTrace('CT_INFO', 'Shutting down');
       unregisterChannelzRef(this.channelzRef);
+      this.secureConnector.destroy();
       process.nextTick(() => {
         this.transitionToState(
           [ConnectivityState.CONNECTING, ConnectivityState.READY],
@@ -500,5 +527,33 @@ export class Subchannel {
     if (newKeepaliveTime > this.keepaliveTime) {
       this.keepaliveTime = newKeepaliveTime;
     }
+  }
+  getCallCredentials(): CallCredentials {
+    return this.secureConnector.getCallCredentials();
+  }
+
+  getChannel(): Channel {
+    if (!this.subchannelChannel) {
+      this.subchannelChannel = new SingleSubchannelChannel(this, this.channelTarget, this.options);
+    }
+    return this.subchannelChannel;
+  }
+
+  addDataWatcher(dataWatcher: DataWatcher): void {
+    throw new Error('Not implemented');
+  }
+
+  getOrCreateDataProducer(name: string, createDataProducer: (subchannel: Subchannel) => DataProducer): DataProducer {
+    const existingProducer = this.dataProducers.get(name);
+    if (existingProducer){
+      return existingProducer;
+    }
+    const newProducer = createDataProducer(this);
+    this.dataProducers.set(name, newProducer);
+    return newProducer;
+  }
+
+  removeDataProducer(name: string) {
+    this.dataProducers.delete(name);
   }
 }

@@ -41,6 +41,8 @@ import PickResult = grpc.experimental.PickResult;
 import PickResultType = grpc.experimental.PickResultType;
 import createChildChannelControlHelper = grpc.experimental.createChildChannelControlHelper;
 import parseLoadBalancingConfig = grpc.experimental.parseLoadBalancingConfig;
+import StatusOr = grpc.experimental.StatusOr;
+import { ChannelOptions } from '@grpc/grpc-js';
 
 grpc_xds.register();
 
@@ -88,23 +90,23 @@ const RPC_BEHAVIOR_CHILD_CONFIG = parseLoadBalancingConfig({round_robin: {}});
 class RpcBehaviorLoadBalancer implements LoadBalancer {
   private child: ChildLoadBalancerHandler;
   private latestConfig: RpcBehaviorLoadBalancingConfig | null = null;
-  constructor(channelControlHelper: ChannelControlHelper, options: grpc.ChannelOptions) {
+  constructor(channelControlHelper: ChannelControlHelper) {
     const childChannelControlHelper = createChildChannelControlHelper(channelControlHelper, {
-      updateState: (connectivityState, picker) => {
+      updateState: (connectivityState, picker, errorMessage) => {
         if (connectivityState === grpc.connectivityState.READY && this.latestConfig) {
           picker = new RpcBehaviorPicker(picker, this.latestConfig.getRpcBehavior());
         }
-        channelControlHelper.updateState(connectivityState, picker);
+        channelControlHelper.updateState(connectivityState, picker, errorMessage);
       }
     });
-    this.child = new ChildLoadBalancerHandler(childChannelControlHelper, options);
+    this.child = new ChildLoadBalancerHandler(childChannelControlHelper);
   }
-  updateAddressList(endpointList: Endpoint[], lbConfig: TypedLoadBalancingConfig, attributes: { [key: string]: unknown; }): void {
+  updateAddressList(endpointList: StatusOr<Endpoint[]>, lbConfig: TypedLoadBalancingConfig, options: ChannelOptions, resolutionNote: string): boolean {
     if (!(lbConfig instanceof RpcBehaviorLoadBalancingConfig)) {
-      return;
+      return false;
     }
     this.latestConfig = lbConfig;
-    this.child.updateAddressList(endpointList, RPC_BEHAVIOR_CHILD_CONFIG, attributes);
+    return this.child.updateAddressList(endpointList, RPC_BEHAVIOR_CHILD_CONFIG, options, resolutionNote);
   }
   exitIdle(): void {
     this.child.exitIdle();
@@ -518,7 +520,9 @@ function main() {
      * channels do not share any subchannels. It does not have any
      * inherent function. */
     console.log(`Interop client channel ${i} starting sending ${argv.qps} QPS to ${argv.server}`);
-    sendConstantQps(new loadedProto.grpc.testing.TestService(argv.server, grpc.credentials.createInsecure(), {'unique': i}),
+    const insecureCreds = grpc.credentials.createInsecure();
+    const creds = new grpc_xds.XdsChannelCredentials(insecureCreds);
+    sendConstantQps(new loadedProto.grpc.testing.TestService(argv.server, creds, {'unique': i}),
       argv.qps,
       argv.fail_on_failed_rpcs === 'true',
       callStatsTracker);

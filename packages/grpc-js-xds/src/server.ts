@@ -15,7 +15,7 @@
  */
 
 import { ConnectionInjector, Metadata, Server, ServerCredentials, ServerInterceptingCall, ServerInterceptor, ServerOptions, StatusObject, experimental, logVerbosity, status } from "@grpc/grpc-js";
-import { BootstrapInfo, formatTemplateString, loadBootstrapInfo, validateBootstrapConfig } from "./xds-bootstrap";
+import { BootstrapInfo, formatTemplateString, loadBootstrapInfo, validateBootstrapConfig, XdsServerConfig } from "./xds-bootstrap";
 import * as net from "net";
 import HostPort = experimental.HostPort;
 import splitHostPort = experimental.splitHostPort;
@@ -29,12 +29,15 @@ import { FilterChainMatch__Output, _envoy_config_listener_v3_FilterChainMatch_Co
 import { CidrRange, cidrRangeEqual, cidrRangeMessageToCidrRange, inCidrRange, normalizeCidrRange } from "./cidr";
 import { Matcher } from "./matcher";
 import { listenersEquivalent } from "./server-listener";
-import { HTTP_CONNECTION_MANGER_TYPE_URL, decodeSingleResource } from "./resources";
+import { DOWNSTREAM_TLS_CONTEXT_TYPE_URL, HTTP_CONNECTION_MANGER_TYPE_URL, decodeSingleResource } from "./resources";
 import { FilterChain__Output } from "./generated/envoy/config/listener/v3/FilterChain";
 import { getPredicateForMatcher } from "./route";
 import { crossProduct } from "./cross-product";
-import { findVirtualHostForDomain } from "./resolver-xds";
+import { findVirtualHostForDomain } from "./xds-dependency-manager";
 import { LogVerbosity } from "@grpc/grpc-js/build/src/constants";
+import { XdsServerCredentials } from "./xds-credentials";
+import { CertificateValidationContext__Output } from "./generated/envoy/extensions/transport_sockets/tls/v3/CertificateValidationContext";
+import { createServerHttpFilter, HttpFilterConfig, parseOverrideFilterConfig, parseTopLevelFilterConfig } from "./http-filter";
 
 const TRACER_NAME = 'xds_server';
 
@@ -62,6 +65,7 @@ interface NormalizedFilterChainMatch {
 }
 
 interface RouteEntry {
+  id: string;
   matcher: Matcher;
   isNonForwardingAction: boolean;
 }
@@ -81,6 +85,7 @@ interface ConfigParameters {
   createConnectionInjector: (credentials: ServerCredentials) => ConnectionInjector;
   drainGraceTimeMs: number;
   listenerResourceNameTemplate: string;
+  unregisterChannelzRef: () => void;
 }
 
 class FilterChainEntry {
@@ -91,6 +96,10 @@ class FilterChainEntry {
   private virtualHosts: VirtualHostEntry[] | null = null;
   private connectionInjector: ConnectionInjector;
   private hasRouteConfigErrors = false;
+  /**
+   * filter name -> route ID -> config
+   */
+  private overrideConfigMaps = new Map<string, Map<string, HttpFilterConfig>>();
   constructor(private configParameters: ConfigParameters, filterChain: FilterChain__Output, credentials: ServerCredentials, onRouteConfigPopulated: () => void) {
     this.matchers = normalizeFilterChainMatch(filterChain.filter_chain_match);
     const httpConnectionManager = decodeSingleResource(HTTP_CONNECTION_MANGER_TYPE_URL, filterChain.filters[0].typed_config!.value);
@@ -142,6 +151,7 @@ class FilterChainEntry {
               for (const route of virtualHost.routes) {
                 if (route.matcher.apply(methodDescriptor.path, metadata)) {
                   if (route.isNonForwardingAction) {
+                    metadata.set('grpc-route', route.id);
                     next(metadata);
                   } else {
                     call.sendStatus(routeErrorStatus);
@@ -155,20 +165,71 @@ class FilterChainEntry {
         }
       });
     }
-    const interceptingCredentials = createServerCredentialsWithInterceptors(credentials, [interceptor]);
+    const httpFilterInterceptors: ServerInterceptor[] = [];
+    for (const filter of httpConnectionManager.http_filters) {
+      const filterConfig = parseTopLevelFilterConfig(filter.typed_config!, false);
+      if (filterConfig) {
+        const filterOverrideConfigMap = new Map<string, HttpFilterConfig>();
+        this.overrideConfigMaps.set(filterConfig.typeUrl, filterOverrideConfigMap);
+        const filterInterceptor = createServerHttpFilter(filterConfig, filterOverrideConfigMap);
+        if (filterInterceptor) {
+          httpFilterInterceptors.push(filterInterceptor);
+        }
+      }
+    }
+    if (credentials instanceof XdsServerCredentials) {
+      if (filterChain.transport_socket) {
+        trace('Using secure credentials');
+        const downstreamTlsContext = decodeSingleResource(DOWNSTREAM_TLS_CONTEXT_TYPE_URL, filterChain.transport_socket.typed_config!.value);
+        const commonTlsContext = downstreamTlsContext.common_tls_context!;
+        const instanceCertificateProvider = configParameters.xdsClient.getCertificateProvider(commonTlsContext.tls_certificate_provider_instance!.instance_name);
+        if (!instanceCertificateProvider) {
+          throw new Error(`Invalid TLS context detected: unrecognized certificate instance name: ${commonTlsContext.tls_certificate_provider_instance!.instance_name}`);
+        }
+        let validationContext: CertificateValidationContext__Output | null = null;
+        if (commonTlsContext?.validation_context_type) {
+          switch (commonTlsContext?.validation_context_type) {
+            case 'validation_context':
+              validationContext = commonTlsContext.validation_context!;
+              break;
+            case 'combined_validation_context':
+              validationContext = commonTlsContext.combined_validation_context!.default_validation_context;
+              break;
+            default:
+              throw new Error(`Invalid TLS context detected: invalid validation_context_type: ${commonTlsContext.validation_context_type}`);
+          }
+        }
+        let caCertificateProvider: experimental.CertificateProvider | null = null;
+        if (validationContext?.ca_certificate_provider_instance) {
+          caCertificateProvider = configParameters.xdsClient.getCertificateProvider(validationContext.ca_certificate_provider_instance.instance_name) ?? null;
+          if (!caCertificateProvider) {
+            throw new Error(`Invalid TLS context detected: unrecognized certificate instance name: ${validationContext.ca_certificate_provider_instance.instance_name}`);
+          }
+        }
+        credentials = experimental.createCertificateProviderServerCredentials(instanceCertificateProvider, caCertificateProvider, downstreamTlsContext.require_client_certificate?.value ?? false);
+      } else {
+        trace('Using fallback credentials');
+        credentials = credentials.getFallbackCredentials();
+      }
+    }
+    const interceptingCredentials = createServerCredentialsWithInterceptors(credentials, [interceptor, ...httpFilterInterceptors]);
     this.connectionInjector = configParameters.createConnectionInjector(interceptingCredentials);
   }
 
   private handleRouteConfigurationResource(routeConfig: RouteConfiguration__Output) {
     let hasRouteConfigErrors = false;
     this.virtualHosts = [];
-    for (const virtualHost of routeConfig.virtual_hosts) {
+    for (const overrideMap of this.overrideConfigMaps.values()) {
+      overrideMap.clear();
+    }
+    for (const [virtualHostIndex, virtualHost] of routeConfig.virtual_hosts.entries()) {
       const virtualHostEntry: VirtualHostEntry = {
         domains: virtualHost.domains,
         routes: []
       };
-      for (const route of virtualHost.routes) {
+      for (const [routeIndex, route] of virtualHost.routes.entries()) {
         const routeEntry: RouteEntry = {
+          id: `virtualhost=${virtualHostIndex} route=${routeIndex}`,
           matcher: getPredicateForMatcher(route.match!),
           isNonForwardingAction: route.action === 'non_forwarding_action'
         };
@@ -177,6 +238,12 @@ class FilterChainEntry {
           this.logConfigurationError('For domains matching [' + virtualHostEntry.domains + '] requests will be rejected for routes matching ' + routeEntry.matcher.toString());
         }
         virtualHostEntry.routes.push(routeEntry);
+        for (const [filterName, overrideConfig] of Object.entries(route.typed_per_filter_config)) {
+          const parsedConfig = parseOverrideFilterConfig(overrideConfig);
+          if (parsedConfig) {
+            this.overrideConfigMaps.get(filterName)?.set(routeEntry.id, parsedConfig);
+          }
+        }
       }
       this.virtualHosts.push(virtualHostEntry);
     }
@@ -254,6 +321,7 @@ class ListenerConfig {
   handleConnection(socket: net.Socket) {
     const matchingFilter = selectMostSpecificallyMatchingFilter(this.filterChainEntries, socket) ?? this.defaultFilterChain;
     if (!matchingFilter) {
+      trace('Rejecting connection from ' + socket.remoteAddress + ': No filter matched');
       socket.destroy();
       return;
     }
@@ -416,12 +484,25 @@ class BoundPortEntry {
     this.tcpServer.close();
     const resourceName = formatTemplateString(this.configParameters.listenerResourceNameTemplate, this.boundAddress);
     ListenerResourceType.cancelWatch(this.configParameters.xdsClient, resourceName, this.listenerWatcher);
+    this.configParameters.unregisterChannelzRef();
   }
 }
 
 function normalizeFilterChainMatch(filterChainMatch: FilterChainMatch__Output | null): NormalizedFilterChainMatch[] {
   if (!filterChainMatch) {
-    return [];
+    filterChainMatch = {
+      address_suffix: '',
+      application_protocols: [],
+      destination_port: null,
+      direct_source_prefix_ranges: [],
+      prefix_ranges: [],
+      server_names: [],
+      source_ports: [],
+      source_prefix_ranges: [],
+      source_type: 'ANY',
+      suffix_len: null,
+      transport_protocol: 'raw_buffer'
+    };
   }
   if (filterChainMatch.destination_port) {
     return [];
@@ -460,7 +541,7 @@ interface MatchFieldEvaluator<MatcherType, FieldType> {
   isMoreSpecific: (matcher1: MatcherType, matcher2: MatcherType) => boolean;
 }
 
-type FieldType<MatcherType> = MatcherType extends CidrRange ? (string | undefined) : MatcherType extends (ConnectionSourceType) ? {localAddress: string, remoteAddress?: (string | undefined)} : MatcherType extends number ? number | undefined : never;
+type FieldType<MatcherType> = MatcherType extends CidrRange ? (string | undefined) : MatcherType extends (ConnectionSourceType) ? {localAddress?: (string | undefined), remoteAddress?: (string | undefined)} : MatcherType extends number ? number | undefined : never;
 
 function cidrRangeMatch(range: CidrRange | undefined, address: string | undefined): boolean {
   return !range || (!!address && inCidrRange(range, address));
@@ -473,14 +554,14 @@ function cidrRangeMoreSpecific(range1: CidrRange | undefined, range2: CidrRange 
   return !!range1 && range1.prefixLen > range2.prefixLen;
 }
 
-function sourceTypeMatch(sourceType: ConnectionSourceType, addresses: {localAddress: string, remoteAddress?: (string | undefined)}): boolean {
+function sourceTypeMatch(sourceType: ConnectionSourceType, addresses: {localAddress?: (string | undefined), remoteAddress?: (string | undefined)}): boolean {
   switch (sourceType) {
     case "ANY":
       return true;
     case "SAME_IP_OR_LOOPBACK":
-      return !!addresses.remoteAddress && isSameIpOrLoopback(addresses.remoteAddress, addresses.localAddress);
+      return !!addresses.localAddress && !!addresses.remoteAddress && isSameIpOrLoopback(addresses.remoteAddress, addresses.localAddress);
     case "EXTERNAL":
-      return !!addresses.remoteAddress && !isSameIpOrLoopback(addresses.remoteAddress, addresses.localAddress);
+      return !!addresses.localAddress && !!addresses.remoteAddress && !isSameIpOrLoopback(addresses.remoteAddress, addresses.localAddress);
   }
 }
 
@@ -490,7 +571,7 @@ const cidrRangeEvaluator: MatchFieldEvaluator<CidrRange | undefined, string | un
   isMoreSpecific: cidrRangeMoreSpecific
 };
 
-const sourceTypeEvaluator: MatchFieldEvaluator<ConnectionSourceType, {localAddress: string, remoteAddress?: (string | undefined)}> = {
+const sourceTypeEvaluator: MatchFieldEvaluator<ConnectionSourceType, {localAddress?: (string | undefined), remoteAddress?: (string | undefined)}> = {
   isMatch: sourceTypeMatch,
   matcherEqual: (matcher1, matcher2) => matcher1 === matcher2,
   isMoreSpecific: (matcher1, matcher2) => matcher1 !== 'ANY' && matcher2 === 'ANY'
@@ -580,11 +661,13 @@ export class XdsServer extends Server {
     if (!hostPort || !isValidIpPort(hostPort)) {
       throw new Error(`Listening port string must have the format IP:port with non-zero port, got ${port}`);
     }
+    const channelzRef = this.experimentalRegisterListenerToChannelz({host: hostPort.host, port: hostPort.port!});
     const configParameters: ConfigParameters = {
-      createConnectionInjector: (credentials) => this.createConnectionInjector(credentials),
+      createConnectionInjector: (credentials) => this.experimentalCreateConnectionInjectorWithChannelzRef(credentials, channelzRef),
       drainGraceTimeMs: this.drainGraceTimeMs,
       listenerResourceNameTemplate: this.listenerResourceNameTemplate,
-      xdsClient: this.xdsClient
+      xdsClient: this.xdsClient,
+      unregisterChannelzRef: () => this.experimentalUnregisterListenerFromChannelz(channelzRef)
     };
     const portEntry = new BoundPortEntry(configParameters, port, creds);
     const servingStatusListener: ServingStatusListener = statusObject => {

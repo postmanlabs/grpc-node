@@ -31,6 +31,7 @@ import UnavailablePicker = experimental.UnavailablePicker;
 import subchannelAddressToString = experimental.subchannelAddressToString;
 import registerLoadBalancerType = experimental.registerLoadBalancerType;
 import EndpointMap = experimental.EndpointMap;
+import StatusOr = experimental.StatusOr;
 import { loadXxhashApi, xxhashApi } from './xxhash';
 import { EXPERIMENTAL_RING_HASH } from './environment';
 import { loadProtosWithOptionsSync } from '@grpc/proto-loader/build/src/util';
@@ -225,37 +226,43 @@ class RingHashLoadBalancer implements LoadBalancer {
   private updatesPaused = false;
   private currentState: connectivityState = connectivityState.IDLE;
   private ring: RingEntry[] = [];
-  private ringHashSizeCap = DEFAULT_RING_SIZE_CAP;
-  constructor(private channelControlHelper: ChannelControlHelper, private options: ChannelOptions) {
+  private latestErrorMessage: string | null = null;
+  constructor(private channelControlHelper: ChannelControlHelper) {
     this.childChannelControlHelper = createChildChannelControlHelper(
       channelControlHelper,
       {
-        updateState: (state, picker) => {
-          this.calculateAndUpdateState();
-          /* If this LB policy is in the TRANSIENT_FAILURE state, requests will
-           * not trigger new connections, so we need to explicitly try connecting
-           * to other endpoints that are currently IDLE to try to eventually
-           * connect to something. */
-          if (
-            state === connectivityState.TRANSIENT_FAILURE &&
-            this.currentState === connectivityState.TRANSIENT_FAILURE
-          ) {
-            for (const leaf of this.leafMap.values()) {
-              const leafState = leaf.getConnectivityState();
-              if (leafState === connectivityState.CONNECTING) {
-                break;
-              }
-              if (leafState === connectivityState.IDLE) {
-                leaf.startConnecting();
-                break;
-              }
-            }
+        updateState: (state, picker, errorMessage) => {
+          if (errorMessage) {
+            this.latestErrorMessage = errorMessage;
           }
+          this.calculateAndUpdateState();
+          this.maybeProactivelyConnect();
         },
       }
     );
-    if (options['grpc.lb.ring_hash.ring_size_cap'] !== undefined) {
-      this.ringHashSizeCap = options['grpc.lb.ring_hash.ring_size_cap'];
+  }
+
+  private maybeProactivelyConnect() {
+    /* If this LB policy is in the TRANSIENT_FAILURE or CONNECTING state,
+     * requests will not trigger new connections, so we need to explicitly try
+     * connecting to other endpoints that are currently IDLE to try to
+     * eventually connect to something. */
+    if (!(this.currentState === connectivityState.TRANSIENT_FAILURE || this.currentState === connectivityState.CONNECTING)) {
+      return;
+    }
+    let firstIdleChild: LeafLoadBalancer | null = null;
+    for (const leaf of this.leafMap.values()) {
+      const leafState = leaf.getConnectivityState();
+      if (leafState === connectivityState.CONNECTING) {
+        firstIdleChild = null;
+        break;
+      }
+      if (leafState === connectivityState.IDLE && !firstIdleChild) {
+        firstIdleChild = leaf;
+      }
+    }
+    if (firstIdleChild) {
+      firstIdleChild.startConnecting();
     }
   }
 
@@ -274,17 +281,20 @@ class RingHashLoadBalancer implements LoadBalancer {
       stateCounts[leaf.getConnectivityState()] += 1;
     }
     if (stateCounts[connectivityState.READY] > 0) {
-      this.updateState(connectivityState.READY, new RingHashPicker(this.ring));
+      this.updateState(connectivityState.READY, new RingHashPicker(this.ring), null);
       // REPORT READY
     } else if (stateCounts[connectivityState.TRANSIENT_FAILURE] > 1) {
+      const errorMessage = `ring hash: no connection established. Latest error: ${this.latestErrorMessage}`;
       this.updateState(
         connectivityState.TRANSIENT_FAILURE,
-        new UnavailablePicker()
+        new UnavailablePicker({details: errorMessage}),
+        errorMessage
       );
     } else if (stateCounts[connectivityState.CONNECTING] > 0) {
       this.updateState(
         connectivityState.CONNECTING,
-        new RingHashPicker(this.ring)
+        new RingHashPicker(this.ring),
+        null
       );
     } else if (
       stateCounts[connectivityState.TRANSIENT_FAILURE] > 0 &&
@@ -292,31 +302,35 @@ class RingHashLoadBalancer implements LoadBalancer {
     ) {
       this.updateState(
         connectivityState.CONNECTING,
-        new RingHashPicker(this.ring)
+        new RingHashPicker(this.ring),
+        null
       );
     } else if (stateCounts[connectivityState.IDLE] > 0) {
-      this.updateState(connectivityState.IDLE, new RingHashPicker(this.ring));
+      this.updateState(connectivityState.IDLE, new RingHashPicker(this.ring), null);
     } else {
+      const errorMessage = `ring hash: no connection established. Latest error: ${this.latestErrorMessage}`;
       this.updateState(
         connectivityState.TRANSIENT_FAILURE,
-        new UnavailablePicker()
+        new UnavailablePicker({details: errorMessage}),
+        errorMessage
       );
     }
   }
 
-  private updateState(newState: connectivityState, picker: Picker) {
+  private updateState(newState: connectivityState, picker: Picker, errorMessage: string | null) {
     trace(
       connectivityState[this.currentState] +
         ' -> ' +
         connectivityState[newState]
     );
     this.currentState = newState;
-    this.channelControlHelper.updateState(newState, picker);
+    this.channelControlHelper.updateState(newState, picker, errorMessage);
   }
 
   private constructRing(
     endpointList: Endpoint[],
-    config: RingHashLoadBalancingConfig
+    config: RingHashLoadBalancingConfig,
+    ringHashSizeCap: number
   ) {
     this.ring = [];
     const endpointWeights: EndpointWeight[] = [];
@@ -336,8 +350,8 @@ class RingHashLoadBalancer implements LoadBalancer {
         minNormalizedWeight
       );
     }
-    const minRingSize = Math.min(config.getMinRingSize(), this.ringHashSizeCap);
-    const maxRingSize = Math.min(config.getMaxRingSize(), this.ringHashSizeCap);
+    const minRingSize = Math.min(config.getMinRingSize(), ringHashSizeCap);
+    const maxRingSize = Math.min(config.getMaxRingSize(), ringHashSizeCap);
     /* Calculate a scale factor that meets the following conditions:
      *  1. The result is between minRingSize and maxRingSize, inclusive
      *  2. The smallest normalized weight is scaled to a whole number, if it
@@ -388,26 +402,44 @@ class RingHashLoadBalancer implements LoadBalancer {
   }
 
   updateAddressList(
-    endpointList: Endpoint[],
+    endpointList: StatusOr<Endpoint[]>,
     lbConfig: TypedLoadBalancingConfig,
-    attributes: { [key: string]: unknown }
-  ): void {
+    options: ChannelOptions,
+    resolutionNote: string
+  ): boolean {
     if (!(lbConfig instanceof RingHashLoadBalancingConfig)) {
       trace('Discarding address update with unrecognized config ' + JSON.stringify(lbConfig.toJsonObject(), undefined, 2));
-      return;
+      return false;
+    }
+    if (!endpointList.ok) {
+      if (this.ring.length === 0) {
+        this.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker(endpointList.error), endpointList.error.details);
+      }
+      return true;
+    }
+    if (endpointList.value.length === 0) {
+      for (const ringEntry of this.ring) {
+        ringEntry.leafBalancer.destroy();
+      }
+      this.ring = [];
+      this.leafMap.clear();
+      this.leafWeightMap.clear();
+      const errorMessage = `No addresses resolved. Resolution note: ${resolutionNote}`;
+      this.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: errorMessage}), errorMessage);
+      return false;
     }
     trace('Received update with config ' + JSON.stringify(lbConfig.toJsonObject(), undefined, 2));
     this.updatesPaused = true;
     this.leafWeightMap.clear();
     const dedupedEndpointList: Endpoint[] = [];
-    for (const endpoint of endpointList) {
+    for (const endpoint of endpointList.value) {
       const leafBalancer = this.leafMap.get(endpoint);
       if (leafBalancer) {
-        leafBalancer.updateEndpoint(endpoint);
+        leafBalancer.updateEndpoint(endpoint, options);
       } else {
         this.leafMap.set(
           endpoint,
-          new LeafLoadBalancer(endpoint, this.childChannelControlHelper, this.options)
+          new LeafLoadBalancer(endpoint, this.childChannelControlHelper, options, resolutionNote)
         );
       }
       const weight = this.leafWeightMap.get(endpoint);
@@ -416,15 +448,18 @@ class RingHashLoadBalancer implements LoadBalancer {
       }
       this.leafWeightMap.set(endpoint, (weight ?? 0) + (isLocalityEndpoint(endpoint) ? endpoint.endpointWeight : 1));
     }
-    const removedLeaves = this.leafMap.deleteMissing(endpointList);
+    const removedLeaves = this.leafMap.deleteMissing(endpointList.value);
     for (const leaf of removedLeaves) {
       leaf.destroy();
     }
+    const ringHashSizeCap = options['grpc.lb.ring_hash.ring_size_cap'] ?? DEFAULT_RING_SIZE_CAP
     loadXxhashApi().then(() => {
-      this.constructRing(dedupedEndpointList, lbConfig);
+      this.constructRing(dedupedEndpointList, lbConfig, ringHashSizeCap);
       this.updatesPaused = false;
       this.calculateAndUpdateState();
+      this.maybeProactivelyConnect();
     });
+    return true;
   }
   exitIdle(): void {
     /* This operation does not make sense here. We don't want to make the whole

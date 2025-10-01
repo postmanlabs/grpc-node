@@ -25,10 +25,18 @@ import LoadBalancer = experimental.LoadBalancer;
 import ChannelControlHelper = experimental.ChannelControlHelper;
 import registerLoadBalancerType = experimental.registerLoadBalancerType;
 import TypedLoadBalancingConfig = experimental.TypedLoadBalancingConfig;
-import QueuePicker = experimental.QueuePicker;
 import parseLoadBalancingConfig = experimental.parseLoadBalancingConfig;
-import { DiscoveryMechanism, XdsClusterResolverChildPolicyHandler } from './load-balancer-xds-cluster-resolver';
-import { CdsUpdate, ClusterResourceType } from './xds-resource-type/cluster-resource-type';
+import StatusOr = experimental.StatusOr;
+import statusOrFromValue = experimental.statusOrFromValue;
+import { XdsConfig } from './xds-dependency-manager';
+import { LocalityEndpoint, PriorityChildRaw } from './load-balancer-priority';
+import { Locality__Output } from './generated/envoy/config/core/v3/Locality';
+import { AGGREGATE_CLUSTER_BACKWARDS_COMPAT, EXPERIMENTAL_OUTLIER_DETECTION } from './environment';
+import { XDS_CLIENT_KEY, XDS_CONFIG_KEY } from './resolver-xds';
+import { ContainsValueMatcher, Matcher, PrefixValueMatcher, RejectValueMatcher, SafeRegexValueMatcher, SuffixValueMatcher, ValueMatcher } from './matcher';
+import { StringMatcher__Output } from './generated/envoy/type/matcher/v3/StringMatcher';
+import { isIPv6 } from 'net';
+import { formatIPv6, parseIPv6 } from './cidr';
 
 const TRACER_NAME = 'cds_balancer';
 
@@ -65,221 +73,379 @@ class CdsLoadBalancingConfig implements TypedLoadBalancingConfig {
   }
 }
 
-interface ClusterEntry {
-  watcher: Watcher<CdsUpdate>;
-  latestUpdate?: CdsUpdate;
-  children: string[];
+type SupportedSanType = 'DNS' | 'URI' | 'email' | 'IP Address';
+
+function isSupportedSanType(type: string): type is SupportedSanType {
+  return ['DNS', 'URI', 'email', 'IP Address'].includes(type);
 }
 
-interface ClusterTree {
-  [name: string]: ClusterEntry;
-}
-
-function isClusterTreeFullyUpdated(tree: ClusterTree, root: string): boolean {
-  const toCheck: string[] = [root];
-  const visited = new Set<string>();
-  while (toCheck.length > 0) {
-    const next = toCheck.shift()!;
-    if (visited.has(next)) {
-      continue;
+class DnsExactValueMatcher implements ValueMatcher {
+  constructor(private targetValue: string, private ignoreCase: boolean) {
+    if (ignoreCase) {
+      this.targetValue = this.targetValue.toLowerCase();
     }
-    visited.add(next);
-    if (!tree[next] || !tree[next].latestUpdate) {
+  }
+  apply(entry: string): boolean {
+    const colonIndex = entry.indexOf(':');
+    if (colonIndex < 0) {
       return false;
     }
-    toCheck.push(...tree[next].children);
+    const type = entry.substring(0, colonIndex);
+    let value = entry.substring(colonIndex + 1);
+    if (!isSupportedSanType(type)) {
+      return false;
+    }
+    if (this.ignoreCase) {
+      value = value.toLowerCase();
+    }
+    if (type === 'DNS' && value.startsWith('*.') && this.targetValue.includes('.', 1)) {
+      return value.substring(2) === this.targetValue.substring(this.targetValue.indexOf('.') + 1);
+    } else {
+      return value === this.targetValue;
+    }
   }
-  return true;
+
+  toString() {
+    return 'DnsExact(' + this.targetValue + ', ignore_case=' + this.ignoreCase + ')';
+  }
 }
 
-function generateDiscoverymechanismForCdsUpdate(config: CdsUpdate): DiscoveryMechanism {
-  if (config.type === 'AGGREGATE') {
-    throw new Error('Cannot generate DiscoveryMechanism for AGGREGATE cluster');
+function canonicalizeSanEntryValue(type: SupportedSanType, value: string): string {
+  if (type === 'IP Address' && isIPv6(value)) {
+    return formatIPv6(parseIPv6(value));
   }
-  return {
-    cluster: config.name,
-    lrs_load_reporting_server: config.lrsLoadReportingServer,
-    max_concurrent_requests: config.maxConcurrentRequests,
-    type: config.type,
-    eds_service_name: config.edsServiceName,
-    dns_hostname: config.dnsHostname,
-    outlier_detection: config.outlierDetectionUpdate
-  };
+  return value;
 }
+
+class SanEntryMatcher implements ValueMatcher {
+  private childMatcher: ValueMatcher;
+  constructor(matcherConfig: StringMatcher__Output) {
+    const ignoreCase = matcherConfig.ignore_case;
+    switch(matcherConfig.match_pattern) {
+      case 'exact':
+        throw new Error('Unexpected exact matcher in SAN entry matcher');
+      case 'prefix':
+        this.childMatcher = new PrefixValueMatcher(matcherConfig.prefix!, ignoreCase);
+        break;
+      case 'suffix':
+        this.childMatcher = new SuffixValueMatcher(matcherConfig.suffix!, ignoreCase);
+        break;
+      case 'safe_regex':
+        this.childMatcher = new SafeRegexValueMatcher(matcherConfig.safe_regex!.regex);
+        break;
+      case 'contains':
+        this.childMatcher = new ContainsValueMatcher(matcherConfig.contains!, ignoreCase);
+        break;
+      default:
+        this.childMatcher = new RejectValueMatcher();
+    }
+  }
+  apply(entry: string): boolean {
+    const colonIndex = entry.indexOf(':');
+    if (colonIndex < 0) {
+      return false;
+    }
+    const type = entry.substring(0, colonIndex);
+    let value = entry.substring(colonIndex + 1);
+    if (!isSupportedSanType(type)) {
+      return false;
+    }
+    value = canonicalizeSanEntryValue(type, value);
+    return this.childMatcher.apply(value);
+  }
+  toString(): string {
+    return this.childMatcher.toString();
+  }
+
+}
+
+export class SanMatcher implements ValueMatcher {
+  private childMatchers: ValueMatcher[];
+  constructor(matcherConfigs: StringMatcher__Output[]) {
+    this.childMatchers = matcherConfigs.map(config => {
+      if (config.match_pattern === 'exact') {
+        return new DnsExactValueMatcher(config.exact!, config.ignore_case);
+      } else {
+        return new SanEntryMatcher(config);
+      }
+    });
+  }
+  apply(value: string): boolean {
+    if (this.childMatchers.length === 0) {
+      return true;
+    }
+    for (const entry of value.split(', ')) {
+      for (const matcher of this.childMatchers) {
+        const checkResult = matcher.apply(entry);
+        if (checkResult) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  toString(): string {
+    return 'SanMatcher(' + this.childMatchers.map(matcher => matcher.toString()).sort().join(', ') + ')';
+  }
+
+  equals(other: SanMatcher): boolean {
+    return this.toString() === other.toString();
+  }
+}
+
+export const CA_CERT_PROVIDER_KEY = 'grpc.internal.ca_cert_provider';
+export const IDENTITY_CERT_PROVIDER_KEY = 'grpc.internal.identity_cert_provider';
+export const SAN_MATCHER_KEY = 'grpc.internal.san_matcher';
 
 const RECURSION_DEPTH_LIMIT = 15;
 
-/**
- * Prerequisite: isClusterTreeFullyUpdated(tree, root)
- * @param tree
- * @param root
- */
-function getDiscoveryMechanismList(tree: ClusterTree, root: string): DiscoveryMechanism[] {
-  const visited = new Set<string>();
-  function getDiscoveryMechanismListHelper(node: string, depth: number): DiscoveryMechanism[] {
-    if (depth > RECURSION_DEPTH_LIMIT) {
-      throw new Error('aggregate cluster graph exceeds max depth');
-    }
-    if (visited.has(node)) {
-      return [];
-    }
-    visited.add(node);
-    if (tree[node].children.length > 0) {
-      trace('Visit ' + node + ' children: [' + tree[node].children + ']');
-      // Aggregate cluster
-      const result = [];
-      for (const child of tree[node].children) {
-        result.push(...getDiscoveryMechanismListHelper(child, depth + 1));
-      }
-      return result;
-    } else {
-      trace('Visit leaf ' + node);
-      // individual cluster
-      const config = tree[node].latestUpdate!;
-      return [generateDiscoverymechanismForCdsUpdate(config)];
-    }
+function getLeafClusters(xdsConfig: XdsConfig, rootCluster: string, depth = 0): string[] {
+  if (depth > RECURSION_DEPTH_LIMIT) {
+    throw new Error(`aggregate cluster graph exceeds max depth of ${RECURSION_DEPTH_LIMIT}`);
   }
-  return getDiscoveryMechanismListHelper(root, 0);
+  const maybeClusterConfig = xdsConfig.clusters.get(rootCluster);
+  if (!maybeClusterConfig) {
+    return [];
+  }
+  if (!maybeClusterConfig.ok) {
+    return [rootCluster];
+  }
+  if (maybeClusterConfig.value.children.type === 'aggregate') {
+    return ([] as string[]).concat(...maybeClusterConfig.value.children.leafClusters.map(childCluster => getLeafClusters(xdsConfig, childCluster, depth + 1)))
+  } else {
+    return [rootCluster];
+  }
 }
+
+export function localityToName(locality: Locality__Output) {
+  return `{region=${locality.region},zone=${locality.zone},sub_zone=${locality.sub_zone}}`;
+}
+
+export const ROOT_CLUSTER_KEY = 'grpc.internal.root_cluster';
 
 export class CdsLoadBalancer implements LoadBalancer {
   private childBalancer: ChildLoadBalancerHandler;
 
-  private latestCdsUpdate: Cluster__Output | null = null;
-
   private latestConfig: CdsLoadBalancingConfig | null = null;
-  private latestAttributes: { [key: string]: unknown } = {};
-  private xdsClient: XdsClient | null = null;
+  private localityPriorities: Map<string, number> = new Map();
+  private priorityNames: string[] = [];
+  private nextPriorityChildNumber = 0;
 
-  private clusterTree: ClusterTree = {};
+  private latestSanMatcher: SanMatcher | null = null;
 
-  private updatedChild = false;
-
-  constructor(private readonly channelControlHelper: ChannelControlHelper, options: ChannelOptions) {
-    this.childBalancer = new XdsClusterResolverChildPolicyHandler(channelControlHelper, options);
+  constructor(private readonly channelControlHelper: ChannelControlHelper) {
+    this.childBalancer = new ChildLoadBalancerHandler(channelControlHelper);
   }
 
-  private reportError(errorMessage: string) {
-    trace('CDS cluster reporting error ' + errorMessage);
-    this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: errorMessage, metadata: new Metadata()}));
-  }
-
-  private addCluster(cluster: string) {
-    if (cluster in this.clusterTree) {
-      return;
-    }
-    trace('Adding watcher for cluster ' + cluster);
-    const watcher: Watcher<CdsUpdate> = new Watcher<CdsUpdate>({
-      onResourceChanged: (update) => {
-        this.clusterTree[cluster].latestUpdate = update;
-        if (update.type === 'AGGREGATE') {
-          const children = update.aggregateChildren
-          trace('Received update for aggregate cluster ' + cluster + ' with children [' + children + ']');
-          this.clusterTree[cluster].children = children;
-          children.forEach(child => this.addCluster(child));
-        }
-        if (isClusterTreeFullyUpdated(this.clusterTree, this.latestConfig!.getCluster())) {
-          let discoveryMechanismList: DiscoveryMechanism[];
-          try {
-            discoveryMechanismList = getDiscoveryMechanismList(this.clusterTree, this.latestConfig!.getCluster());
-          } catch (e) {
-            this.reportError((e as Error).message);
-            return;
-          }
-          const rootClusterUpdate = this.clusterTree[this.latestConfig!.getCluster()].latestUpdate!;
-          const clusterResolverConfig: LoadBalancingConfig = {
-            xds_cluster_resolver: {
-              discovery_mechanisms: discoveryMechanismList,
-              xds_lb_policy: rootClusterUpdate.lbPolicyConfig
-            }
-          };
-          let parsedClusterResolverConfig: TypedLoadBalancingConfig;
-          try {
-            parsedClusterResolverConfig = parseLoadBalancingConfig(clusterResolverConfig);
-          } catch (e) {
-            this.reportError(`CDS cluster ${this.latestConfig?.getCluster()} child config parsing failed with error ${(e as Error).message}`);
-            return;
-          }
-          trace('Child update config: ' + JSON.stringify(clusterResolverConfig));
-          this.updatedChild = true;
-          this.childBalancer.updateAddressList(
-            [],
-            parsedClusterResolverConfig,
-            this.latestAttributes
-          );
-        }
-      },
-      onResourceDoesNotExist: () => {
-        trace('Received onResourceDoesNotExist update for cluster ' + cluster);
-        if (cluster in this.clusterTree) {
-          this.clusterTree[cluster].latestUpdate = undefined;
-          this.clusterTree[cluster].children = [];
-        }
-        this.reportError(`CDS resource ${cluster} does not exist`);
-        this.childBalancer.destroy();
-      },
-      onError: (statusObj) => {
-        if (!this.updatedChild) {
-          trace('Transitioning to transient failure due to onError update for cluster' + cluster);
-          this.reportError(`xDS request failed with error ${statusObj.details}`);
-        }
-      }
-    });
-    this.clusterTree[cluster] = {
-      watcher: watcher,
-      children: []
-    };
-    if (this.xdsClient) {
-      ClusterResourceType.startWatch(this.xdsClient, cluster, watcher);
-    }
-  }
-
-  private removeCluster(cluster: string) {
-    if (!(cluster in this.clusterTree)) {
-      return;
-    }
-    if (this.xdsClient) {
-      ClusterResourceType.cancelWatch(this.xdsClient, cluster, this.clusterTree[cluster].watcher);
-    }
-    delete this.clusterTree[cluster];
-  }
-
-  private clearClusterTree() {
-    for (const cluster of Object.keys(this.clusterTree)) {
-      this.removeCluster(cluster);
-    }
+  private getNextPriorityName(cluster: string) {
+    return `cluster=${cluster}, child_number=${this.nextPriorityChildNumber++}`;
   }
 
   updateAddressList(
-    endpointList: Endpoint[],
+    endpointList: StatusOr<Endpoint[]>,
     lbConfig: TypedLoadBalancingConfig,
-    attributes: { [key: string]: unknown }
-  ): void {
+    options: ChannelOptions,
+    resolutionNote: string
+  ): boolean {
     if (!(lbConfig instanceof CdsLoadBalancingConfig)) {
       trace('Discarding address list update with unrecognized config ' + JSON.stringify(lbConfig, undefined, 2));
-      return;
+      return false;
     }
     trace('Received update with config ' + JSON.stringify(lbConfig, undefined, 2));
-    this.latestAttributes = attributes;
-    this.xdsClient = attributes.xdsClient as XdsClient;
-
-    /* If the cluster is changing, disable the old watcher before adding the new
-     * one */
-    if (
-      this.latestConfig && this.latestConfig.getCluster() !== lbConfig.getCluster()
-    ) {
-      trace('Removing old cluster watchers rooted at ' + this.latestConfig.getCluster());
-      this.clearClusterTree();
-      this.updatedChild = false;
+    const xdsConfig = options[XDS_CONFIG_KEY] as XdsConfig;
+    const clusterName = lbConfig.getCluster();
+    const maybeClusterConfig = xdsConfig.clusters.get(clusterName);
+    if (!maybeClusterConfig) {
+      trace('Received update with no config for cluster ' + clusterName);
+      return false;
     }
-
-    if (!this.latestConfig) {
-      this.channelControlHelper.updateState(connectivityState.CONNECTING, new QueuePicker(this));
+    if (!maybeClusterConfig.ok) {
+      this.childBalancer.destroy();
+      this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker(maybeClusterConfig.error), maybeClusterConfig.error.details);
+      return true;
     }
+    const clusterConfig = maybeClusterConfig.value;
 
-    this.latestConfig = lbConfig;
+    if (clusterConfig.children.type === 'aggregate') {
+      let leafClusters: string[];
+      try {
+        leafClusters = getLeafClusters(xdsConfig, clusterName);
+      } catch (e) {
+        trace('xDS config parsing failed with error ' + (e as Error).message);
+        const errorMessage = `xDS config parsing failed with error ${(e as Error).message}`;
+        this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: `${errorMessage} Resolution note: ${resolutionNote}`}), errorMessage);
+        return true;
+      }
+      const priorityChildren: {[name: string]: PriorityChildRaw} = {};
+      for (const cluster of leafClusters) {
+        priorityChildren[cluster] = {
+          config: [{
+            cds: {
+              cluster: cluster
+            }
+          }],
+          ignore_reresolution_requests: false
+        };
+      }
+      const childConfig = {
+        priority: {
+          children: priorityChildren,
+          priorities: leafClusters
+        }
+      };
+      let typedChildConfig: TypedLoadBalancingConfig;
+      try {
+        typedChildConfig = parseLoadBalancingConfig(childConfig);
+      } catch (e) {
+        trace('LB policy config parsing failed with error ' + (e as Error).message);
+        const errorMessage = `LB policy config parsing failed with error ${(e as Error).message}`;
+        this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: `${errorMessage} Resolution note: ${resolutionNote}`}), errorMessage);
+        return true;
+      }
+      this.childBalancer.updateAddressList(endpointList, typedChildConfig, {...options, [ROOT_CLUSTER_KEY]: clusterName}, resolutionNote);
+    } else {
+      if (!clusterConfig.children.endpoints) {
+        trace('Received update with no resolved endpoints for cluster ' + clusterName);
+        const errorMessage = `Cluster ${clusterName} resolution failed: ${clusterConfig.children.resolutionNote}`;
+        this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: errorMessage}), errorMessage);
+        return false;
+      }
+      const newPriorityNames: string[] = [];
+      const newLocalityPriorities = new Map<string, number>();
+      const priorityChildren: {[name: string]: PriorityChildRaw} = {};
+      const childEndpointList: LocalityEndpoint[] = [];
+      let endpointPickingPolicy: LoadBalancingConfig[];
+      if (clusterConfig.cluster.type === 'EDS') {
+        endpointPickingPolicy = clusterConfig.cluster.lbPolicyConfig;
+        if (AGGREGATE_CLUSTER_BACKWARDS_COMPAT) {
+          if (typeof options[ROOT_CLUSTER_KEY] === 'string') {
+            const maybeRootClusterConfig = xdsConfig.clusters.get(options[ROOT_CLUSTER_KEY]);
+            if (maybeRootClusterConfig?.ok) {
+              endpointPickingPolicy = maybeRootClusterConfig.value.cluster.lbPolicyConfig;
+            }
+          }
+        }
+      } else {
+        endpointPickingPolicy = [{ pick_first: {} }];
+      }
+      for (const [priority, priorityEntry] of clusterConfig.children.endpoints.priorities.entries()) {
+        /**
+         * Highest (smallest number) priority value that any of the localities in
+         * this locality array had a in the previous mapping.
+         */
+        let highestOldPriority = Infinity;
+        for (const localityObj of priorityEntry.localities) {
+          const oldPriority = this.localityPriorities.get(
+            localityToName(localityObj.locality)
+          );
+          if (
+            oldPriority !== undefined &&
+            oldPriority >= priority &&
+            oldPriority < highestOldPriority
+          ) {
+            highestOldPriority = oldPriority;
+          }
+        }
+        let newPriorityName: string;
+        if (highestOldPriority === Infinity) {
+          /* No existing priority at or below the same number as the priority we
+           * are looking at had any of the localities in this priority. So, we
+           * use a new name. */
+          newPriorityName = this.getNextPriorityName(clusterName);
+        } else {
+          const newName = this.priorityNames[highestOldPriority];
+          if (newPriorityNames.indexOf(newName) < 0) {
+            newPriorityName = newName;
+          } else {
+            newPriorityName = this.getNextPriorityName(clusterName);
+          }
+        }
+        newPriorityNames[priority] = newPriorityName;
 
-    this.addCluster(lbConfig.getCluster());
+        for (const localityObj of priorityEntry.localities) {
+          for (const weightedEndpoint of localityObj.endpoints) {
+            childEndpointList.push({
+              localityPath: [
+                newPriorityName,
+                localityToName(localityObj.locality),
+              ],
+              locality: localityObj.locality,
+              localityWeight: localityObj.weight,
+              endpointWeight: localityObj.weight * weightedEndpoint.weight,
+              ...weightedEndpoint.endpoint
+            });
+          }
+          newLocalityPriorities.set(localityToName(localityObj.locality), priority);
+        }
+
+        priorityChildren[newPriorityName] = {
+          config: endpointPickingPolicy,
+          ignore_reresolution_requests: clusterConfig.cluster.type === 'EDS'
+        };
+      }
+      this.localityPriorities = newLocalityPriorities;
+      this.priorityNames = newPriorityNames;
+      const xdsClusterImplConfig = {
+        xds_cluster_impl: {
+          cluster: clusterName,
+          child_policy: [{
+            priority: {
+              children: priorityChildren,
+              priorities: newPriorityNames
+            }
+          }]
+        }
+      };
+      let childConfig: LoadBalancingConfig;
+      if (EXPERIMENTAL_OUTLIER_DETECTION) {
+        childConfig = {
+          outlier_detection: {
+            ...clusterConfig.cluster.outlierDetectionUpdate,
+            child_policy: [xdsClusterImplConfig]
+          }
+        }
+      } else {
+        childConfig = xdsClusterImplConfig;
+      }
+      let typedChildConfig: TypedLoadBalancingConfig;
+      try {
+        typedChildConfig = parseLoadBalancingConfig(childConfig);
+      } catch (e) {
+        trace('LB policy config parsing failed with error ' + (e as Error).message);
+        const errorMessage = `LB policy config parsing failed with error ${(e as Error).message}. Resolution note: ${resolutionNote}`;
+        this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: errorMessage}), errorMessage);
+        return false;
+      }
+      const childOptions: ChannelOptions = {...options};
+      if (clusterConfig.cluster.securityUpdate) {
+        const securityUpdate = clusterConfig.cluster.securityUpdate;
+        const xdsClient = options[XDS_CLIENT_KEY] as XdsClient;
+        const caCertProvider = xdsClient.getCertificateProvider(securityUpdate.caCertificateProviderInstance);
+        if (!caCertProvider) {
+          const errorMessage = `Cluster ${clusterName} configured with CA certificate provider ${securityUpdate.caCertificateProviderInstance} not in bootstrap. Resolution note: ${resolutionNote}`;
+          this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: errorMessage}), errorMessage);
+          return false;
+        }
+        if (securityUpdate.identityCertificateProviderInstance) {
+          const identityCertProvider = xdsClient.getCertificateProvider(securityUpdate.identityCertificateProviderInstance);
+          if (!identityCertProvider) {
+            const errorMessage = `Cluster ${clusterName} configured with identity certificate provider ${securityUpdate.identityCertificateProviderInstance} not in bootstrap. Resolution note: ${resolutionNote}`;
+            this.channelControlHelper.updateState(connectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: status.UNAVAILABLE, details: errorMessage}), errorMessage);
+            return false;
+          }
+          childOptions[IDENTITY_CERT_PROVIDER_KEY] = identityCertProvider;
+        }
+        childOptions[CA_CERT_PROVIDER_KEY] = caCertProvider;
+        const sanMatcher = new SanMatcher(securityUpdate.subjectAltNameMatchers);
+        if (this.latestSanMatcher === null || !this.latestSanMatcher.equals(sanMatcher)) {
+          this.latestSanMatcher = sanMatcher;
+        }
+        trace('Configured subject alternative name matcher: ' + sanMatcher);
+        childOptions[SAN_MATCHER_KEY] = this.latestSanMatcher;
+      }
+      this.childBalancer.updateAddressList(statusOrFromValue(childEndpointList), typedChildConfig, childOptions, resolutionNote);
+    }
+    return true;
   }
   exitIdle(): void {
     this.childBalancer.exitIdle();
@@ -290,7 +456,6 @@ export class CdsLoadBalancer implements LoadBalancer {
   destroy(): void {
     trace('Destroying load balancer rooted at cluster named ' + this.latestConfig?.getCluster());
     this.childBalancer.destroy();
-    this.clearClusterTree();
   }
   getTypeName(): string {
     return TYPE_NAME;

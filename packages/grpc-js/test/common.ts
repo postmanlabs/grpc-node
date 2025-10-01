@@ -30,6 +30,7 @@ import {
 } from '../src/make-client';
 import { readFileSync } from 'fs';
 import {
+  DataWatcher,
   HealthListener,
   SubchannelInterface,
 } from '../src/subchannel-interface';
@@ -150,15 +151,15 @@ export class TestClient {
     this.client.waitForReady(deadline, callback);
   }
 
-  sendRequest(callback: (error?: grpc.ServiceError) => void) {
-    this.client.echo({}, callback);
+  sendRequest(callback: (error?: grpc.ServiceError) => void): grpc.ClientUnaryCall {
+    return this.client.echo({}, callback);
   }
 
   sendRequestWithMetadata(
     metadata: grpc.Metadata,
     callback: (error?: grpc.ServiceError) => void
-  ) {
-    this.client.echo({}, metadata, callback);
+  ): grpc.ClientUnaryCall {
+    return this.client.echo({}, metadata, callback);
   }
 
   getChannelState() {
@@ -204,6 +205,9 @@ export class MockSubchannel implements SubchannelInterface {
     initialState: grpc.connectivityState = grpc.connectivityState.IDLE
   ) {
     this.state = initialState;
+  }
+  addDataWatcher(dataWatcher: DataWatcher): void {
+    throw new Error('Method not implemented.');
   }
   getConnectivityState(): grpc.connectivityState {
     return this.state;
@@ -258,6 +262,12 @@ export class MockSubchannel implements SubchannelInterface {
   }
   addHealthStateWatcher(listener: HealthListener): void {}
   removeHealthStateWatcher(listener: HealthListener): void {}
+  getCallCredentials(): grpc.CallCredentials {
+    return grpc.CallCredentials.createEmpty();
+  }
+  getChannel(): grpc.Channel {
+    throw new Error('Method not implemented');
+  }
 }
 
 export { assert2 };

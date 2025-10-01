@@ -19,6 +19,7 @@ import { SecureServerOptions } from 'http2';
 import { CIPHER_SUITES, getDefaultRootsData } from './tls-helpers';
 import { SecureContextOptions } from 'tls';
 import { ServerInterceptor } from '.';
+import { CaCertificateUpdate, CaCertificateUpdateListener, CertificateProvider, IdentityCertificateUpdate, IdentityCertificateUpdateListener } from './certificate-provider';
 
 export interface KeyCertPair {
   private_key: Buffer;
@@ -31,26 +32,34 @@ export interface SecureContextWatcher {
 
 export abstract class ServerCredentials {
   private watchers: Set<SecureContextWatcher> = new Set();
-  private latestContextOptions: SecureServerOptions | null = null;
+  private latestContextOptions: SecureContextOptions | null = null;
+  constructor(private serverConstructorOptions: SecureServerOptions | null, contextOptions?: SecureContextOptions) {
+    this.latestContextOptions = contextOptions ?? null;
+  }
+
   _addWatcher(watcher: SecureContextWatcher) {
     this.watchers.add(watcher);
   }
   _removeWatcher(watcher: SecureContextWatcher) {
     this.watchers.delete(watcher);
   }
-  protected updateSecureContextOptions(options: SecureServerOptions | null) {
-    if (options) {
-      this.latestContextOptions = options;
-    } else {
-      this.latestContextOptions = null;
-    }
+  protected getWatcherCount() {
+    return this.watchers.size;
+  }
+  protected updateSecureContextOptions(options: SecureContextOptions | null) {
+    this.latestContextOptions = options;
     for (const watcher of this.watchers) {
       watcher(this.latestContextOptions);
     }
   }
-  abstract _isSecure(): boolean;
-  _getSettings(): SecureServerOptions | null {
+  _isSecure(): boolean {
+    return this.serverConstructorOptions !== null;
+  }
+  _getSecureContextOptions(): SecureContextOptions | null {
     return this.latestContextOptions;
+  }
+  _getConstructorOptions(): SecureServerOptions | null {
+    return this.serverConstructorOptions;
   }
   _getInterceptors(): ServerInterceptor[] {
     return [];
@@ -101,18 +110,19 @@ export abstract class ServerCredentials {
     }
 
     return new SecureServerCredentials({
+      requestCert: checkClientCertificate,
+      ciphers: CIPHER_SUITES,
+    }, {
       ca: rootCerts ?? getDefaultRootsData() ?? undefined,
       cert,
       key,
-      requestCert: checkClientCertificate,
-      ciphers: CIPHER_SUITES,
     });
   }
 }
 
 class InsecureServerCredentials extends ServerCredentials {
-  _isSecure(): boolean {
-    return false;
+  constructor() {
+    super(null);
   }
 
   _getSettings(): null {
@@ -127,17 +137,9 @@ class InsecureServerCredentials extends ServerCredentials {
 class SecureServerCredentials extends ServerCredentials {
   private options: SecureServerOptions;
 
-  constructor(options: SecureServerOptions) {
-    super();
-    this.options = options;
-  }
-
-  _isSecure(): boolean {
-    return true;
-  }
-
-  _getSettings(): SecureServerOptions {
-    return this.options;
+  constructor(constructorOptions: SecureServerOptions, contextOptions: SecureContextOptions) {
+    super(constructorOptions, contextOptions);
+    this.options = {...constructorOptions, ...contextOptions};
   }
 
   /**
@@ -219,9 +221,94 @@ class SecureServerCredentials extends ServerCredentials {
   }
 }
 
+class CertificateProviderServerCredentials extends ServerCredentials {
+  private latestCaUpdate: CaCertificateUpdate | null = null;
+  private latestIdentityUpdate: IdentityCertificateUpdate | null = null;
+  private caCertificateUpdateListener: CaCertificateUpdateListener = this.handleCaCertificateUpdate.bind(this);
+  private identityCertificateUpdateListener: IdentityCertificateUpdateListener = this.handleIdentityCertitificateUpdate.bind(this);
+  constructor(
+    private identityCertificateProvider: CertificateProvider,
+    private caCertificateProvider: CertificateProvider | null,
+    private requireClientCertificate: boolean
+  ) {
+    super({
+      requestCert: caCertificateProvider !== null,
+      rejectUnauthorized: requireClientCertificate,
+      ciphers: CIPHER_SUITES
+    });
+  }
+  _addWatcher(watcher: SecureContextWatcher): void {
+    if (this.getWatcherCount() === 0) {
+      this.caCertificateProvider?.addCaCertificateListener(this.caCertificateUpdateListener);
+      this.identityCertificateProvider.addIdentityCertificateListener(this.identityCertificateUpdateListener);
+    }
+    super._addWatcher(watcher);
+  }
+  _removeWatcher(watcher: SecureContextWatcher): void {
+    super._removeWatcher(watcher);
+    if (this.getWatcherCount() === 0) {
+      this.caCertificateProvider?.removeCaCertificateListener(this.caCertificateUpdateListener);
+      this.identityCertificateProvider.removeIdentityCertificateListener(this.identityCertificateUpdateListener);
+    }
+  }
+  _equals(other: ServerCredentials): boolean {
+    if (this === other) {
+      return true;
+    }
+    if (!(other instanceof CertificateProviderServerCredentials)) {
+      return false;
+    }
+    return (
+      this.caCertificateProvider === other.caCertificateProvider &&
+      this.identityCertificateProvider === other.identityCertificateProvider &&
+      this.requireClientCertificate === other.requireClientCertificate
+    )
+  }
+
+  private calculateSecureContextOptions(): SecureContextOptions | null {
+    if (this.latestIdentityUpdate === null) {
+      return null;
+    }
+    if (this.caCertificateProvider !== null && this.latestCaUpdate === null) {
+      return null;
+    }
+    return {
+      ca: this.latestCaUpdate?.caCertificate,
+      cert: [this.latestIdentityUpdate.certificate],
+      key: [this.latestIdentityUpdate.privateKey],
+    };
+  }
+
+  private finalizeUpdate() {
+    const secureContextOptions = this.calculateSecureContextOptions();
+    this.updateSecureContextOptions(secureContextOptions);
+  }
+
+  private handleCaCertificateUpdate(update: CaCertificateUpdate | null) {
+    this.latestCaUpdate = update;
+    this.finalizeUpdate();
+  }
+
+  private handleIdentityCertitificateUpdate(update: IdentityCertificateUpdate | null) {
+    this.latestIdentityUpdate = update;
+    this.finalizeUpdate();
+  }
+}
+
+export function createCertificateProviderServerCredentials(
+  caCertificateProvider: CertificateProvider,
+  identityCertificateProvider: CertificateProvider | null,
+  requireClientCertificate: boolean
+) {
+  return new CertificateProviderServerCredentials(
+    caCertificateProvider,
+    identityCertificateProvider,
+    requireClientCertificate);
+}
+
 class InterceptorServerCredentials extends ServerCredentials {
   constructor(private readonly childCredentials: ServerCredentials, private readonly interceptors: ServerInterceptor[]) {
-    super();
+    super({});
   }
   _isSecure(): boolean {
     return this.childCredentials._isSecure();
@@ -251,6 +338,12 @@ class InterceptorServerCredentials extends ServerCredentials {
   }
   override _removeWatcher(watcher: SecureContextWatcher): void {
     this.childCredentials._removeWatcher(watcher);
+  }
+  override _getConstructorOptions(): SecureServerOptions | null {
+    return this.childCredentials._getConstructorOptions();
+  }
+  override _getSecureContextOptions(): SecureContextOptions | null {
+    return this.childCredentials._getSecureContextOptions();
   }
 }
 

@@ -27,6 +27,8 @@ import QueuePicker = experimental.QueuePicker;
 import UnavailablePicker = experimental.UnavailablePicker;
 import ChildLoadBalancerHandler = experimental.ChildLoadBalancerHandler;
 import selectLbConfigFromList = experimental.selectLbConfigFromList;
+import StatusOr = experimental.StatusOr;
+import statusOrFromValue = experimental.statusOrFromValue;
 import { Locality__Output } from './generated/envoy/config/core/v3/Locality';
 
 const TRACER_NAME = 'priority';
@@ -155,9 +157,10 @@ class PriorityLoadBalancingConfig implements TypedLoadBalancingConfig {
 
 interface PriorityChildBalancer {
   updateAddressList(
-    endpointList: Endpoint[],
+    endpointList: StatusOr<Endpoint[]>,
     lbConfig: TypedLoadBalancingConfig,
-    attributes: { [key: string]: unknown }
+    attributes: { [key: string]: unknown },
+    resolutionNote: string
   ): void;
   exitIdle(): void;
   resetBackoff(): void;
@@ -166,6 +169,7 @@ interface PriorityChildBalancer {
   isFailoverTimerPending(): boolean;
   getConnectivityState(): ConnectivityState;
   getPicker(): Picker;
+  getErrorMessage(): string | null;
   getName(): string;
   destroy(): void;
 }
@@ -183,29 +187,31 @@ export class PriorityLoadBalancer implements LoadBalancer {
   private PriorityChildImpl = class implements PriorityChildBalancer {
     private connectivityState: ConnectivityState = ConnectivityState.IDLE;
     private picker: Picker;
+    private errorMessage: string | null = null;
     private childBalancer: ChildLoadBalancerHandler;
-    private failoverTimer: NodeJS.Timer | null = null;
-    private deactivationTimer: NodeJS.Timer | null = null;
+    private failoverTimer: NodeJS.Timeout | null = null;
+    private deactivationTimer: NodeJS.Timeout | null = null;
     private seenReadyOrIdleSinceTransientFailure = false;
     constructor(private parent: PriorityLoadBalancer, private name: string, ignoreReresolutionRequests: boolean) {
       this.childBalancer = new ChildLoadBalancerHandler(experimental.createChildChannelControlHelper(this.parent.channelControlHelper, {
-        updateState: (connectivityState: ConnectivityState, picker: Picker) => {
-          this.updateState(connectivityState, picker);
+        updateState: (connectivityState: ConnectivityState, picker: Picker, errorMessage: string | null) => {
+          this.updateState(connectivityState, picker, errorMessage);
         },
         requestReresolution: () => {
           if (!ignoreReresolutionRequests) {
             this.parent.channelControlHelper.requestReresolution();
           }
         }
-      }), parent.options);
+      }));
       this.picker = new QueuePicker(this.childBalancer);
       this.startFailoverTimer();
     }
 
-    private updateState(connectivityState: ConnectivityState, picker: Picker) {
+    private updateState(connectivityState: ConnectivityState, picker: Picker, errorMessage: string | null) {
       trace('Child ' + this.name + ' ' + ConnectivityState[this.connectivityState] + ' -> ' + ConnectivityState[connectivityState]);
       this.connectivityState = connectivityState;
       this.picker = picker;
+      this.errorMessage = errorMessage;
       if (connectivityState === ConnectivityState.CONNECTING) {
         if (this.seenReadyOrIdleSinceTransientFailure && this.failoverTimer === null) {
           this.startFailoverTimer();
@@ -226,20 +232,23 @@ export class PriorityLoadBalancer implements LoadBalancer {
         this.failoverTimer = setTimeout(() => {
           trace('Failover timer triggered for child ' + this.name);
           this.failoverTimer = null;
+          const errorMessage = `No connection established. Last error: ${this.errorMessage}`;
           this.updateState(
             ConnectivityState.TRANSIENT_FAILURE,
-            new UnavailablePicker()
+            new UnavailablePicker({code: Status.UNAVAILABLE, details: errorMessage}),
+            errorMessage
           );
         }, DEFAULT_FAILOVER_TIME_MS);
       }
     }
 
     updateAddressList(
-      endpointList: Endpoint[],
+      endpointList: StatusOr<Endpoint[]>,
       lbConfig: TypedLoadBalancingConfig,
-      attributes: { [key: string]: unknown }
+      attributes: { [key: string]: unknown },
+      resolutionNote: string
     ): void {
-      this.childBalancer.updateAddressList(endpointList, lbConfig, attributes);
+      this.childBalancer.updateAddressList(endpointList, lbConfig, attributes, resolutionNote);
     }
 
     exitIdle() {
@@ -285,6 +294,10 @@ export class PriorityLoadBalancer implements LoadBalancer {
       return this.picker;
     }
 
+    getErrorMessage() {
+      return this.errorMessage;
+    }
+
     getName() {
       return this.name;
     }
@@ -307,7 +320,7 @@ export class PriorityLoadBalancer implements LoadBalancer {
    * The attributes object from the latest update, saved to be passed along to
    * each new child as they are created
    */
-  private latestAttributes: { [key: string]: unknown } = {};
+  private latestOptions: ChannelOptions = {};
   /**
    * The latest load balancing policies and address lists for each child from
    * the latest update
@@ -323,9 +336,11 @@ export class PriorityLoadBalancer implements LoadBalancer {
 
   private updatesPaused = false;
 
-  constructor(private channelControlHelper: ChannelControlHelper, private options: ChannelOptions) {}
+  private latestResolutionNote: string = '';
 
-  private updateState(state: ConnectivityState, picker: Picker) {
+  constructor(private channelControlHelper: ChannelControlHelper) {}
+
+  private updateState(state: ConnectivityState, picker: Picker, errorMessage: string | null) {
     trace(
         'Transitioning to ' +
         ConnectivityState[state]
@@ -336,7 +351,7 @@ export class PriorityLoadBalancer implements LoadBalancer {
     if (state === ConnectivityState.IDLE) {
       picker = new QueuePicker(this, picker);
     }
-    this.channelControlHelper.updateState(state, picker);
+    this.channelControlHelper.updateState(state, picker, errorMessage);
   }
 
   private onChildStateChange(child: PriorityChildBalancer) {
@@ -363,7 +378,8 @@ export class PriorityLoadBalancer implements LoadBalancer {
     const chosenChild = this.children.get(this.priorities[priority])!;
     this.updateState(
       chosenChild.getConnectivityState(),
-      chosenChild.getPicker()
+      chosenChild.getPicker(),
+      chosenChild.getErrorMessage()
     );
     if (deactivateLowerPriorities) {
       for (let i = priority + 1; i < this.priorities.length; i++) {
@@ -374,7 +390,8 @@ export class PriorityLoadBalancer implements LoadBalancer {
 
   private choosePriority() {
     if (this.priorities.length === 0) {
-      this.updateState(ConnectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: Status.UNAVAILABLE, details: 'priority policy has empty priority list', metadata: new Metadata()}));
+      const errorMessage = 'priority policy has empty priority list';
+      this.updateState(ConnectivityState.TRANSIENT_FAILURE, new UnavailablePicker({code: Status.UNAVAILABLE, details: errorMessage}), errorMessage);
       return;
     }
 
@@ -390,9 +407,10 @@ export class PriorityLoadBalancer implements LoadBalancer {
         child = new this.PriorityChildImpl(this, childName, childUpdate.ignoreReresolutionRequests);
         this.children.set(childName, child);
         child.updateAddressList(
-          childUpdate.subchannelAddress,
+          statusOrFromValue(childUpdate.subchannelAddress),
           childUpdate.lbConfig,
-          this.latestAttributes
+          this.latestOptions,
+          this.latestResolutionNote
         );
       } else {
         /* We're going to try to use this child, so reactivate it if it has been
@@ -429,14 +447,21 @@ export class PriorityLoadBalancer implements LoadBalancer {
   }
 
   updateAddressList(
-    endpointList: Endpoint[],
+    endpointList: StatusOr<Endpoint[]>,
     lbConfig: TypedLoadBalancingConfig,
-    attributes: { [key: string]: unknown }
-  ): void {
+    options: ChannelOptions,
+    resolutionNote: string
+  ): boolean {
     if (!(lbConfig instanceof PriorityLoadBalancingConfig)) {
       // Reject a config of the wrong type
       trace('Discarding address list update with unrecognized config ' + JSON.stringify(lbConfig.toJsonObject(), undefined, 2));
-      return;
+      return false;
+    }
+    if (!endpointList.ok) {
+      if (this.latestUpdates.size === 0) {
+        this.updateState(ConnectivityState.TRANSIENT_FAILURE, new UnavailablePicker(endpointList.error), endpointList.error.details);
+      }
+      return true;
     }
     /* For each address, the first element of its localityPath array determines
      * which child it belongs to. So we bucket those addresses by that first
@@ -446,14 +471,14 @@ export class PriorityLoadBalancer implements LoadBalancer {
       string,
       LocalityEndpoint[]
     >();
-    for (const endpoint of endpointList) {
+    for (const endpoint of endpointList.value) {
       if (!isLocalityEndpoint(endpoint)) {
         // Reject address that cannot be prioritized
-        return;
+        return false;
       }
       if (endpoint.localityPath.length < 1) {
         // Reject address that cannot be prioritized
-        return;
+        return false;
       }
       const childName = endpoint.localityPath[0];
       const childAddress: LocalityEndpoint = {
@@ -467,7 +492,7 @@ export class PriorityLoadBalancer implements LoadBalancer {
       }
       childAddressList.push(childAddress);
     }
-    this.latestAttributes = attributes;
+    this.latestOptions = options;
     this.latestUpdates.clear();
     this.priorities = lbConfig.getPriorities();
     this.updatesPaused = true;
@@ -484,9 +509,10 @@ export class PriorityLoadBalancer implements LoadBalancer {
       const existingChild = this.children.get(childName);
       if (existingChild !== undefined) {
         existingChild.updateAddressList(
-          childAddresses,
+          statusOrFromValue(childAddresses),
           childConfig.config,
-          attributes
+          options,
+          resolutionNote
         );
       }
     }
@@ -498,7 +524,9 @@ export class PriorityLoadBalancer implements LoadBalancer {
       }
     }
     this.updatesPaused = false;
+    this.latestResolutionNote = resolutionNote;
     this.choosePriority();
+    return true;
   }
   exitIdle(): void {
     if (this.currentPriority !== null) {

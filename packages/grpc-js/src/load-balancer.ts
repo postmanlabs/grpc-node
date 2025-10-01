@@ -24,6 +24,7 @@ import { SubchannelInterface } from './subchannel-interface';
 import { LoadBalancingConfig } from './service-config';
 import { log } from './logging';
 import { LogVerbosity } from './constants';
+import { StatusOr } from './call-interface';
 
 /**
  * A collection of functions associated with a channel that a load balancer
@@ -33,7 +34,7 @@ export interface ChannelControlHelper {
   /**
    * Returns a subchannel connected to the specified address.
    * @param subchannelAddress The address to connect to
-   * @param subchannelArgs Extra channel arguments specified by the load balancer
+   * @param subchannelArgs Channel arguments to use to construct the subchannel
    */
   createSubchannel(
     subchannelAddress: SubchannelAddress,
@@ -46,7 +47,11 @@ export interface ChannelControlHelper {
    * @param connectivityState New connectivity state
    * @param picker New picker
    */
-  updateState(connectivityState: ConnectivityState, picker: Picker): void;
+  updateState(
+    connectivityState: ConnectivityState,
+    picker: Picker,
+    errorMessage: string | null
+  ): void;
   /**
    * Request new data from the resolver.
    */
@@ -98,12 +103,16 @@ export interface LoadBalancer {
    * @param endpointList The new list of addresses to connect to
    * @param lbConfig The load balancing config object from the service config,
    *     if one was provided
+   * @param channelOptions Channel options from the channel, plus resolver
+   *     attributes
+   * @param resolutionNote A not from the resolver to include in errors
    */
   updateAddressList(
-    endpointList: Endpoint[],
+    endpointList: StatusOr<Endpoint[]>,
     lbConfig: TypedLoadBalancingConfig,
-    attributes: { [key: string]: unknown }
-  ): void;
+    channelOptions: ChannelOptions,
+    resolutionNote: string
+  ): boolean;
   /**
    * If the load balancer is currently in the IDLE state, start connecting.
    */
@@ -129,8 +138,7 @@ export interface LoadBalancer {
 
 export interface LoadBalancerConstructor {
   new (
-    channelControlHelper: ChannelControlHelper,
-    options: ChannelOptions
+    channelControlHelper: ChannelControlHelper
   ): LoadBalancer;
 }
 
@@ -172,14 +180,12 @@ export function registerDefaultLoadBalancerType(typeName: string) {
 
 export function createLoadBalancer(
   config: TypedLoadBalancingConfig,
-  channelControlHelper: ChannelControlHelper,
-  options: ChannelOptions
+  channelControlHelper: ChannelControlHelper
 ): LoadBalancer | null {
   const typeName = config.getLoadBalancerName();
   if (typeName in registeredLoadBalancerTypes) {
     return new registeredLoadBalancerTypes[typeName].LoadBalancer(
-      channelControlHelper,
-      options
+      channelControlHelper
     );
   } else {
     return null;

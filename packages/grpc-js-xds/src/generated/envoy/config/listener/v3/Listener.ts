@@ -47,7 +47,7 @@ export interface _envoy_config_listener_v3_Listener_ConnectionBalanceConfig__Out
    * [#extension-category: envoy.network.connection_balance]
    */
   'extend_balance'?: (_envoy_config_core_v3_TypedExtensionConfig__Output | null);
-  'balance_type': "exact_balance"|"extend_balance";
+  'balance_type'?: "exact_balance"|"extend_balance";
 }
 
 /**
@@ -148,7 +148,7 @@ export interface _envoy_config_listener_v3_Listener_InternalListenerConfig__Outp
 }
 
 /**
- * [#next-free-field: 35]
+ * [#next-free-field: 36]
  */
 export interface Listener {
   /**
@@ -450,13 +450,17 @@ export interface Listener {
    */
   'max_connections_to_accept_per_socket_event'?: (_google_protobuf_UInt32Value | null);
   /**
+   * Whether the listener bypasses configured overload manager actions.
+   */
+  'bypass_overload_manager'?: (boolean);
+  /**
    * The exclusive listener type and the corresponding config.
    */
   'listener_specifier'?: "internal_listener";
 }
 
 /**
- * [#next-free-field: 35]
+ * [#next-free-field: 36]
  */
 export interface Listener__Output {
   /**
@@ -758,7 +762,11 @@ export interface Listener__Output {
    */
   'max_connections_to_accept_per_socket_event': (_google_protobuf_UInt32Value__Output | null);
   /**
+   * Whether the listener bypasses configured overload manager actions.
+   */
+  'bypass_overload_manager': (boolean);
+  /**
    * The exclusive listener type and the corresponding config.
    */
-  'listener_specifier': "internal_listener";
+  'listener_specifier'?: "internal_listener";
 }

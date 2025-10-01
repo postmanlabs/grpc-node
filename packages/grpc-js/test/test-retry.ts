@@ -175,6 +175,10 @@ describe('Retries', () => {
             },
           },
         ],
+        retryThrottling: {
+          maxTokens: 1000,
+          tokenRatio: 0.1,
+        },
       };
       client = new EchoService(
         `localhost:${port}`,
@@ -319,6 +323,22 @@ describe('Retries', () => {
         (error: grpc.ServiceError, response: any) => {
           assert.ifError(error);
           assert.deepStrictEqual(response, { value: 'test value', value2: 3 });
+          done();
+        }
+      );
+    });
+
+    it('Should not retry on custom error code', done => {
+      const metadata = new grpc.Metadata();
+      metadata.set('succeed-on-retry-attempt', '2');
+      metadata.set('respond-with-status', '300');
+      client.echo(
+        { value: 'test value', value2: 3 },
+        metadata,
+        (error: grpc.ServiceError, response: any) => {
+          assert(error);
+          assert.strictEqual(error.code, 300);
+          assert.strictEqual(error.details, 'Failed on retry 0');
           done();
         }
       );

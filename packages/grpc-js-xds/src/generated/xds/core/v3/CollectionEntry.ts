@@ -8,8 +8,8 @@ import type { Any as _google_protobuf_Any, Any__Output as _google_protobuf_Any__
  */
 export interface _xds_core_v3_CollectionEntry_InlineEntry {
   /**
-   * Optional name to describe the inlined resource. Resource names must
-   * [a-zA-Z0-9_-\./]+ (TODO(htuch): turn this into a PGV constraint once
+   * Optional name to describe the inlined resource. Resource names must match
+   * ``[a-zA-Z0-9_-\./]+`` (TODO(htuch): turn this into a PGV constraint once
    * finalized, probably should be a RFC3986 pchar). This name allows
    * reference via the #entry directive in ResourceLocator.
    */
@@ -30,8 +30,8 @@ export interface _xds_core_v3_CollectionEntry_InlineEntry {
  */
 export interface _xds_core_v3_CollectionEntry_InlineEntry__Output {
   /**
-   * Optional name to describe the inlined resource. Resource names must
-   * [a-zA-Z0-9_-\./]+ (TODO(htuch): turn this into a PGV constraint once
+   * Optional name to describe the inlined resource. Resource names must match
+   * ``[a-zA-Z0-9_-\./]+`` (TODO(htuch): turn this into a PGV constraint once
    * finalized, probably should be a RFC3986 pchar). This name allows
    * reference via the #entry directive in ResourceLocator.
    */
@@ -51,6 +51,8 @@ export interface _xds_core_v3_CollectionEntry_InlineEntry__Output {
  * xDS collection resource wrapper. This encapsulates a xDS resource when
  * appearing inside a list collection resource. List collection resources are
  * regular Resource messages of type:
+ * 
+ * .. code-block:: proto
  * 
  * message <T>Collection {
  * repeated CollectionEntry resources = 1;
@@ -73,6 +75,8 @@ export interface CollectionEntry {
  * appearing inside a list collection resource. List collection resources are
  * regular Resource messages of type:
  * 
+ * .. code-block:: proto
+ * 
  * message <T>Collection {
  * repeated CollectionEntry resources = 1;
  * }
@@ -86,5 +90,5 @@ export interface CollectionEntry__Output {
    * The resource is inlined in the list collection.
    */
   'inline_entry'?: (_xds_core_v3_CollectionEntry_InlineEntry__Output | null);
-  'resource_specifier': "locator"|"inline_entry";
+  'resource_specifier'?: "locator"|"inline_entry";
 }

@@ -37,6 +37,7 @@ import { InternalChannel } from './internal-channel';
 import { Metadata } from './metadata';
 import * as logging from './logging';
 import { restrictControlPlaneStatusCode } from './control-plane-status';
+import { AuthContext } from './auth-context';
 
 const TRACER_NAME = 'resolving_call';
 
@@ -62,12 +63,18 @@ export class ResolvingCall implements Call {
   private configReceivedTime: Date | null = null;
   private childStartTime: Date | null = null;
 
+  /**
+   * Credentials configured for this specific call. Does not include
+   * call credentials associated with the channel credentials used to create
+   * the channel.
+   */
+  private credentials: CallCredentials = CallCredentials.createEmpty();
+
   constructor(
     private readonly channel: InternalChannel,
     private readonly method: string,
     options: CallStreamOptions,
     private readonly filterStackFactory: FilterStackFactory,
-    private credentials: CallCredentials,
     private callNumber: number
   ) {
     this.deadline = options.deadline;
@@ -239,7 +246,7 @@ export class ResolvingCall implements Call {
     this.filterStack = this.filterStackFactory.createFilter();
     this.filterStack.sendMetadata(Promise.resolve(this.metadata)).then(
       filteredMetadata => {
-        this.child = this.channel.createInnerCall(
+        this.child = this.channel.createRetryingCall(
           config,
           this.method,
           this.host,
@@ -351,7 +358,7 @@ export class ResolvingCall implements Call {
     }
   }
   setCredentials(credentials: CallCredentials): void {
-    this.credentials = this.credentials.compose(credentials);
+    this.credentials = credentials;
   }
 
   addStatusWatcher(watcher: (status: StatusObject) => void) {
@@ -360,5 +367,13 @@ export class ResolvingCall implements Call {
 
   getCallNumber(): number {
     return this.callNumber;
+  }
+
+  getAuthContext(): AuthContext | null {
+    if (this.child) {
+      return this.child.getAuthContext();
+    } else {
+      return null;
+    }
   }
 }
