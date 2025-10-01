@@ -1,6 +1,6 @@
 // Original file: proto/xds/xds/data/orca/v3/orca_load_report.proto
 
-import type { Long } from '@grpc/proto-loader';
+import type { Long } from '@postman/proto-loader';
 
 export interface OrcaLoadReport {
   /**

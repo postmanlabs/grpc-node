@@ -1,7 +1,7 @@
 // Original file: proto/xds/xds/service/orca/v3/orca.proto
 
 import type * as grpc from '../../../../../index'
-import type { MethodDefinition } from '@grpc/proto-loader'
+import type { MethodDefinition } from '@postman/proto-loader'
 import type { OrcaLoadReport as _xds_data_orca_v3_OrcaLoadReport, OrcaLoadReport__Output as _xds_data_orca_v3_OrcaLoadReport__Output } from '../../../../xds/data/orca/v3/OrcaLoadReport';
 import type { OrcaLoadReportRequest as _xds_service_orca_v3_OrcaLoadReportRequest, OrcaLoadReportRequest__Output as _xds_service_orca_v3_OrcaLoadReportRequest__Output } from '../../../../xds/service/orca/v3/OrcaLoadReportRequest';
 

@@ -1,6 +1,6 @@
 {
   "name": "@postman/grpc-js",
-  "version": "1.11.0-postman.1",
+  "version": "1.14.0-postman.1",
   "description": "gRPC Library for Node - pure JS implementation",
   "homepage": "https://grpc.io/",
   "repository": "https://github.com/postmanlabs/grpc-node/tree/master/packages/grpc-js",
@@ -68,7 +68,7 @@
     "copy-protos": "node ./copy-protos"
   },
   "dependencies": {
-    "@postman/proto-loader": "^0.7.13-postman.3",
+    "@postman/proto-loader": "^0.8.0-postman.1",
     "@js-sdsl/ordered-map": "^4.4.2"
   },
   "files": [

@@ -23,7 +23,7 @@ import { ServiceClient } from '../src/make-client';
 import { assert2, loadProtoFile } from './common';
 import { ProtoGrpcType as OrcaProtoGrpcType } from "../src/generated/orca";
 import { PerRequestMetricRecorder, ServerMetricRecorder } from '../src/orca';
-import { loadSync } from '@grpc/proto-loader';
+import { loadSync } from '@postman/proto-loader';
 import { OpenRcaServiceClient } from '../src/generated/xds/service/orca/v3/OpenRcaService';
 import { OrcaLoadReport__Output } from '../src/generated/xds/data/orca/v3/OrcaLoadReport';
 import { msToDuration } from '../src/duration';

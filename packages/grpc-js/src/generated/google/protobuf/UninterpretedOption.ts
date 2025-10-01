@@ -1,6 +1,6 @@
 // Original file: null
 
-import type { Long } from '@grpc/proto-loader';
+import type { Long } from '@postman/proto-loader';
 
 export interface _google_protobuf_UninterpretedOption_NamePart {
   'namePart'?: (string);
