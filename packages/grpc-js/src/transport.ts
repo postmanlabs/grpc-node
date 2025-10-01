@@ -17,14 +17,11 @@
 
 import * as http2 from 'http2';
 import {
-  checkServerIdentity,
   CipherNameAndProtocol,
-  ConnectionOptions,
-  PeerCertificate,
   TLSSocket,
 } from 'tls';
 import { PartialStatusObject } from './call-interface';
-import { ChannelCredentials } from './channel-credentials';
+import { SecureConnector, SecureConnectResult } from './channel-credentials';
 import { ChannelOptions } from './channel-options';
 import {
   ChannelzCallTracker,
@@ -36,7 +33,7 @@ import {
   unregisterChannelzRef,
 } from './channelz';
 import { LogVerbosity } from './constants';
-import { getProxiedConnection, ProxyConnectionResult } from './http_proxy';
+import { getProxiedConnection } from './http_proxy';
 import * as logging from './logging';
 import { getDefaultAuthority } from './resolver';
 import {
@@ -44,7 +41,7 @@ import {
   SubchannelAddress,
   subchannelAddressToString,
 } from './subchannel-address';
-import { GrpcUri, parseUri, splitHostPort, uriToString } from './uri-parser';
+import { GrpcUri, parseUri, uriToString } from './uri-parser';
 import * as net from 'net';
 import {
   Http2SubchannelCall,
@@ -53,6 +50,8 @@ import {
 } from './subchannel-call';
 import { Metadata } from './metadata';
 import { getNextCallNumber } from './call-number';
+import { Socket } from 'net';
+import { AuthContext } from './auth-context';
 
 const TRACER_NAME = 'transport';
 const FLOW_CONTROL_TRACER_NAME = 'transport_flowctrl';
@@ -85,6 +84,7 @@ export interface Transport {
   getChannelzRef(): SocketRef;
   getPeerName(): string;
   getOptions(): ChannelOptions;
+  getAuthContext(): AuthContext;
   createCall(
     metadata: Metadata,
     host: string,
@@ -130,6 +130,8 @@ class Http2Transport implements Transport {
   private disconnectListeners: TransportDisconnectListener[] = [];
 
   private disconnectHandled = false;
+
+  private authContext: AuthContext;
 
   // Channelz info
   private channelzRef: SocketRef;
@@ -223,9 +225,13 @@ class Http2Transport implements Transport {
     );
 
     session.once('error', error => {
-      /* Do nothing here. Any error should also trigger a close event, which is
-       * where we want to handle that.  */
       this.trace('connection closed with error ' + (error as Error).message);
+      this.handleDisconnect();
+    });
+
+    session.socket.once('close', (hadError) => {
+      this.trace('connection closed. hadError=' + hadError);
+      this.handleDisconnect();
     });
 
     if (logging.isTracerEnabled(TRACER_NAME)) {
@@ -251,6 +257,15 @@ class Http2Transport implements Transport {
      * which should only happen after everything else is set up. */
     if (this.keepaliveWithoutCalls) {
       this.maybeStartKeepalivePingTimer();
+    }
+
+    if (session.socket instanceof TLSSocket) {
+      this.authContext = {
+        transportSecurityType: 'ssl',
+        sslPeerCertificate: session.socket.getPeerCertificate()
+      };
+    } else {
+      this.authContext = {};
     }
   }
 
@@ -385,12 +400,11 @@ class Http2Transport implements Transport {
   private handleDisconnect() {
     this.clearKeepaliveTimeout();
     this.reportDisconnectToOwner(false);
-    /* Give calls an event loop cycle to finish naturally before reporting the
-     * disconnnection to them. */
+    for (const call of this.activeCalls) {
+      call.onDisconnect();
+    }
+    // Wait an event loop cycle before destroying the connection
     setImmediate(() => {
-      for (const call of this.activeCalls) {
-        call.onDisconnect();
-      }
       this.session.destroy();
     });
   }
@@ -628,6 +642,10 @@ class Http2Transport implements Transport {
     return this.options;
   }
 
+  getAuthContext(): AuthContext {
+    return this.authContext;
+  }
+
   shutdown() {
     this.session.close();
     unregisterChannelzRef(this.channelzRef);
@@ -637,7 +655,7 @@ class Http2Transport implements Transport {
 export interface SubchannelConnector {
   connect(
     address: SubchannelAddress,
-    credentials: ChannelCredentials,
+    secureConnector: SecureConnector,
     options: ChannelOptions
   ): Promise<Transport>;
   shutdown(): void;
@@ -657,198 +675,147 @@ export class Http2SubchannelConnector implements SubchannelConnector {
   }
 
   private createSession(
+    secureConnectResult: SecureConnectResult,
     address: SubchannelAddress,
-    credentials: ChannelCredentials,
-    options: ChannelOptions,
-    proxyConnectionResult: ProxyConnectionResult
-  ): Promise<Http2Transport> {
-    if (this.isShutdown) {
-      return Promise.reject();
-    }
-
-    return new Promise<Http2Transport>((resolve, reject) => {
-      let remoteName: string | null;
-      if (proxyConnectionResult.realTarget) {
-        remoteName = uriToString(proxyConnectionResult.realTarget);
-        this.trace(
-          'creating HTTP/2 session through proxy to ' +
-            uriToString(proxyConnectionResult.realTarget)
-        );
-      } else {
-        remoteName = null;
-        this.trace(
-          'creating HTTP/2 session to ' + subchannelAddressToString(address)
-        );
-      }
-      const targetAuthority = getDefaultAuthority(
-        proxyConnectionResult.realTarget ?? this.channelTarget
-      );
-      let connectionOptions: http2.SecureClientSessionOptions =
-        credentials._getConnectionOptions() || {};
-      connectionOptions.maxSendHeaderBlockLength = Number.MAX_SAFE_INTEGER;
-      if ('grpc-node.max_session_memory' in options) {
-        connectionOptions.maxSessionMemory =
-          options['grpc-node.max_session_memory'];
-      } else {
-        /* By default, set a very large max session memory limit, to effectively
-         * disable enforcement of the limit. Some testing indicates that Node's
-         * behavior degrades badly when this limit is reached, so we solve that
-         * by disabling the check entirely. */
-        connectionOptions.maxSessionMemory = Number.MAX_SAFE_INTEGER;
-      }
-      let addressScheme = 'http://';
-      if ('secureContext' in connectionOptions) {
-        addressScheme = 'https://';
-        // If provided, the value of grpc.ssl_target_name_override should be used
-        // to override the target hostname when checking server identity.
-        // This option is used for testing only.
-        if (options['grpc.ssl_target_name_override']) {
-          const sslTargetNameOverride =
-            options['grpc.ssl_target_name_override']!;
-          const originalCheckServerIdentity =
-            connectionOptions.checkServerIdentity ?? checkServerIdentity;
-          connectionOptions.checkServerIdentity = (
-            host: string,
-            cert: PeerCertificate
-          ): Error | undefined => {
-            return originalCheckServerIdentity(sslTargetNameOverride, cert);
-          };
-          connectionOptions.servername = sslTargetNameOverride;
-        } else {
-          const authorityHostname =
-            splitHostPort(targetAuthority)?.host ?? 'localhost';
-          // We want to always set servername to support SNI
-          connectionOptions.servername = authorityHostname;
-        }
-        if (proxyConnectionResult.socket) {
-          /* This is part of the workaround for
-           * https://github.com/nodejs/node/issues/32922. Without that bug,
-           * proxyConnectionResult.socket would always be a plaintext socket and
-           * this would say
-           * connectionOptions.socket = proxyConnectionResult.socket; */
-          connectionOptions.createConnection = (authority, option) => {
-            return proxyConnectionResult.socket!;
-          };
-        }
-      } else {
-        /* In all but the most recent versions of Node, http2.connect does not use
-         * the options when establishing plaintext connections, so we need to
-         * establish that connection explicitly. */
-        connectionOptions.createConnection = (authority, option) => {
-          if (proxyConnectionResult.socket) {
-            return proxyConnectionResult.socket;
-          } else {
-            /* net.NetConnectOpts is declared in a way that is more restrictive
-             * than what net.connect will actually accept, so we use the type
-             * assertion to work around that. */
-            return net.connect(address);
-          }
-        };
-      }
-
-      connectionOptions = {
-        ...connectionOptions,
-        ...address,
-        enableTrace: options['grpc-node.tls_enable_trace'] === 1,
-      };
-
-      /* http2.connect uses the options here:
-       * https://github.com/nodejs/node/blob/70c32a6d190e2b5d7b9ff9d5b6a459d14e8b7d59/lib/internal/http2/core.js#L3028-L3036
-       * The spread operator overides earlier values with later ones, so any port
-       * or host values in the options will be used rather than any values extracted
-       * from the first argument. In addition, the path overrides the host and port,
-       * as documented for plaintext connections here:
-       * https://nodejs.org/api/net.html#net_socket_connect_options_connectlistener
-       * and for TLS connections here:
-       * https://nodejs.org/api/tls.html#tls_tls_connect_options_callback. In
-       * earlier versions of Node, http2.connect passes these options to
-       * tls.connect but not net.connect, so in the insecure case we still need
-       * to set the createConnection option above to create the connection
-       * explicitly. We cannot do that in the TLS case because http2.connect
-       * passes necessary additional options to tls.connect.
-       * The first argument just needs to be parseable as a URL and the scheme
-       * determines whether the connection will be established over TLS or not.
-       */
-      const session = http2.connect(
-        addressScheme + targetAuthority,
-        connectionOptions
-      );
-      this.session = session;
-      let errorMessage = 'Failed to connect';
-      session.unref();
-      session.once('connect', () => {
-        session.removeAllListeners();
-        resolve(new Http2Transport(session, address, options, remoteName));
-        this.session = null;
-      });
-      session.once('close', () => {
-        this.session = null;
-        // Leave time for error event to happen before rejecting
-        setImmediate(() => {
-          reject(`${errorMessage} (${new Date().toISOString()})`);
-        });
-      });
-      session.once('error', error => {
-        errorMessage = (error as Error).message;
-        this.trace('connection failed with error ' + errorMessage);
-      });
-    });
-  }
-
-  connect(
-    address: SubchannelAddress,
-    credentials: ChannelCredentials,
     options: ChannelOptions
   ): Promise<Http2Transport> {
     if (this.isShutdown) {
       return Promise.reject();
     }
-    /* Pass connection options through to the proxy so that it's able to
-     * upgrade it's connection to support tls if needed.
-     * This is a workaround for https://github.com/nodejs/node/issues/32922
-     * See https://github.com/grpc/grpc-node/pull/1369 for more info. */
-    const connectionOptions: ConnectionOptions =
-      credentials._getConnectionOptions() || {};
 
-    if ('secureContext' in connectionOptions) {
-      connectionOptions.ALPNProtocols = ['h2'];
-      // If provided, the value of grpc.ssl_target_name_override should be used
-      // to override the target hostname when checking server identity.
-      // This option is used for testing only.
-      if (options['grpc.ssl_target_name_override']) {
-        const sslTargetNameOverride = options['grpc.ssl_target_name_override']!;
-        const originalCheckServerIdentity =
-          connectionOptions.checkServerIdentity ?? checkServerIdentity;
-        connectionOptions.checkServerIdentity = (
-          host: string,
-          cert: PeerCertificate
-        ): Error | undefined => {
-          return originalCheckServerIdentity(sslTargetNameOverride, cert);
-        };
-        connectionOptions.servername = sslTargetNameOverride;
-      } else {
-        if ('grpc.http_connect_target' in options) {
-          /* This is more or less how servername will be set in createSession
-           * if a connection is successfully established through the proxy.
-           * If the proxy is not used, these connectionOptions are discarded
-           * anyway */
-          const targetPath = getDefaultAuthority(
-            parseUri(options['grpc.http_connect_target'] as string) ?? {
-              path: 'localhost',
-            }
-          );
-          const hostPort = splitHostPort(targetPath);
-          connectionOptions.servername = hostPort?.host ?? targetPath;
-        }
-      }
-      if (options['grpc-node.tls_enable_trace']) {
-        connectionOptions.enableTrace = true;
-      }
+    if (secureConnectResult.socket.closed) {
+      return Promise.reject('Connection closed before starting HTTP/2 handshake');
     }
 
-    return getProxiedConnection(address, options, connectionOptions).then(
-      result => this.createSession(address, credentials, options, result)
-    );
+    return new Promise<Http2Transport>((resolve, reject) => {
+      let remoteName: string | null = null;
+      let realTarget: GrpcUri = this.channelTarget;
+      if ('grpc.http_connect_target' in options) {
+        const parsedTarget = parseUri(options['grpc.http_connect_target']!);
+        if (parsedTarget) {
+          realTarget = parsedTarget;
+          remoteName = uriToString(parsedTarget);
+        }
+      }
+      const scheme = secureConnectResult.secure ? 'https' : 'http';
+      const targetPath = getDefaultAuthority(realTarget);
+      const closeHandler = () => {
+        this.session?.destroy();
+        this.session = null;
+        // Leave time for error event to happen before rejecting
+        setImmediate(() => {
+          if (!reportedError) {
+            reportedError = true;
+            reject(`${errorMessage.trim()} (${new Date().toISOString()})`);
+          }
+        });
+      };
+      const errorHandler = (error: Error) => {
+        this.session?.destroy();
+        errorMessage = (error as Error).message;
+        this.trace('connection failed with error ' + errorMessage);
+        if (!reportedError) {
+          reportedError = true;
+          reject(`${errorMessage} (${new Date().toISOString()})`);
+        }
+      };
+      const sessionOptions: http2.ClientSessionOptions = {
+        createConnection: (authority, option) => {
+          return secureConnectResult.socket;
+        },
+        settings: {
+          initialWindowSize:
+            options['grpc-node.flow_control_window'] ??
+            http2.getDefaultSettings?.()?.initialWindowSize ?? 65535,
+        }
+      };
+      const session = http2.connect(`${scheme}://${targetPath}`, sessionOptions);
+      // Prepare window size configuration for remoteSettings handler
+      const defaultWin = http2.getDefaultSettings?.()?.initialWindowSize ?? 65535; // 65 535 B
+      const connWin = options[
+        'grpc-node.flow_control_window'
+      ] as number | undefined;
+
+      this.session = session;
+      let errorMessage = 'Failed to connect';
+      let reportedError = false;
+      session.unref();
+      session.once('remoteSettings', () => {
+        // Send WINDOW_UPDATE now to avoid 65 KB start-window stall.
+        if (connWin && connWin > defaultWin) {
+          try {
+            // Node ≥ 14.18
+            (session as any).setLocalWindowSize(connWin);
+          } catch {
+            // Older Node: bump by the delta
+            const delta = connWin - (session.state.localWindowSize ?? defaultWin);
+            if (delta > 0) (session as any).incrementWindowSize(delta);
+          }
+        }
+
+        session.removeAllListeners();
+        secureConnectResult.socket.removeListener('close', closeHandler);
+        secureConnectResult.socket.removeListener('error', errorHandler);
+        resolve(new Http2Transport(session, address, options, remoteName));
+        this.session = null;
+      });
+      session.once('close', closeHandler);
+      session.once('error', errorHandler);
+      secureConnectResult.socket.once('close', closeHandler);
+      secureConnectResult.socket.once('error', errorHandler);
+    });
+  }
+
+  private tcpConnect(address: SubchannelAddress, options: ChannelOptions): Promise<Socket> {
+    return getProxiedConnection(address, options).then(proxiedSocket => {
+      if (proxiedSocket) {
+        return proxiedSocket;
+      } else {
+        return new Promise<Socket>((resolve, reject) => {
+          const closeCallback = () => {
+            reject(new Error('Socket closed'));
+          };
+          const errorCallback = (error: Error) => {
+            reject(error);
+          }
+          const socket = net.connect(address, () => {
+            socket.removeListener('close', closeCallback);
+            socket.removeListener('error', errorCallback);
+            resolve(socket);
+          });
+          socket.once('close', closeCallback);
+          socket.once('error', errorCallback);
+        });
+      }
+    });
+  }
+
+  async connect(
+    address: SubchannelAddress,
+    secureConnector: SecureConnector,
+    options: ChannelOptions
+  ): Promise<Http2Transport> {
+    if (this.isShutdown) {
+      return Promise.reject();
+    }
+    let tcpConnection: net.Socket | null = null;
+    let secureConnectResult: SecureConnectResult | null  = null;
+    const addressString = subchannelAddressToString(address);
+    try {
+      this.trace(addressString + ' Waiting for secureConnector to be ready');
+      await secureConnector.waitForReady();
+      this.trace(addressString + ' secureConnector is ready');
+      tcpConnection = await this.tcpConnect(address, options);
+      tcpConnection.setNoDelay();
+      this.trace(addressString + ' Established TCP connection');
+      secureConnectResult = await secureConnector.connect(tcpConnection);
+      this.trace(addressString + ' Established secure connection');
+      return this.createSession(secureConnectResult, address, options);
+    } catch (e) {
+      tcpConnection?.destroy();
+      secureConnectResult?.socket.destroy();
+      throw e;
+    }
   }
 
   shutdown(): void {

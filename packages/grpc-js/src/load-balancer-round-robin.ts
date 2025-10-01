@@ -39,6 +39,7 @@ import {
 } from './subchannel-address';
 import { LeafLoadBalancer } from './load-balancer-pick-first';
 import { ChannelOptions } from './channel-options';
+import { StatusOr } from './call-interface';
 
 const TRACER_NAME = 'round_robin';
 
@@ -89,6 +90,10 @@ class RoundRobinPicker implements Picker {
   }
 }
 
+function rotateArray<T>(list: T[], startIndex: number) {
+  return [...list.slice(startIndex), ...list.slice(0, startIndex)];
+}
+
 export class RoundRobinLoadBalancer implements LoadBalancer {
   private children: LeafLoadBalancer[] = [];
 
@@ -103,13 +108,22 @@ export class RoundRobinLoadBalancer implements LoadBalancer {
   private lastError: string | null = null;
 
   constructor(
-    private readonly channelControlHelper: ChannelControlHelper,
-    private readonly options: ChannelOptions
+    private readonly channelControlHelper: ChannelControlHelper
   ) {
     this.childChannelControlHelper = createChildChannelControlHelper(
       channelControlHelper,
       {
-        updateState: (connectivityState, picker) => {
+        updateState: (connectivityState, picker, errorMessage) => {
+          /* Ensure that name resolution is requested again after active
+           * connections are dropped. This is more aggressive than necessary to
+           * accomplish that, so we are counting on resolvers to have
+           * reasonable rate limits. */
+          if (this.currentState === ConnectivityState.READY && connectivityState !== ConnectivityState.READY) {
+            this.channelControlHelper.requestReresolution();
+          }
+          if (errorMessage) {
+            this.lastError = errorMessage;
+          }
           this.calculateAndUpdateState();
         },
       }
@@ -147,21 +161,24 @@ export class RoundRobinLoadBalancer implements LoadBalancer {
             picker: child.getPicker(),
           })),
           index
-        )
+        ),
+        null
       );
     } else if (this.countChildrenWithState(ConnectivityState.CONNECTING) > 0) {
-      this.updateState(ConnectivityState.CONNECTING, new QueuePicker(this));
+      this.updateState(ConnectivityState.CONNECTING, new QueuePicker(this), null);
     } else if (
       this.countChildrenWithState(ConnectivityState.TRANSIENT_FAILURE) > 0
     ) {
+      const errorMessage = `round_robin: No connection established. Last error: ${this.lastError}`;
       this.updateState(
         ConnectivityState.TRANSIENT_FAILURE,
         new UnavailablePicker({
-          details: `No connection established. Last error: ${this.lastError}`,
-        })
+          details: errorMessage,
+        }),
+        errorMessage
       );
     } else {
-      this.updateState(ConnectivityState.IDLE, new QueuePicker(this));
+      this.updateState(ConnectivityState.IDLE, new QueuePicker(this), null);
     }
     /* round_robin should keep all children connected, this is how we do that.
      * We can't do this more efficiently in the individual child's updateState
@@ -174,7 +191,7 @@ export class RoundRobinLoadBalancer implements LoadBalancer {
     }
   }
 
-  private updateState(newState: ConnectivityState, picker: Picker) {
+  private updateState(newState: ConnectivityState, picker: Picker, errorMessage: string | null) {
     trace(
       ConnectivityState[this.currentState] +
         ' -> ' +
@@ -186,20 +203,46 @@ export class RoundRobinLoadBalancer implements LoadBalancer {
       this.currentReadyPicker = null;
     }
     this.currentState = newState;
-    this.channelControlHelper.updateState(newState, picker);
+    this.channelControlHelper.updateState(newState, picker, errorMessage);
   }
 
   private resetSubchannelList() {
     for (const child of this.children) {
       child.destroy();
     }
+    this.children = [];
   }
 
   updateAddressList(
-    endpointList: Endpoint[],
-    lbConfig: TypedLoadBalancingConfig
-  ): void {
+    maybeEndpointList: StatusOr<Endpoint[]>,
+    lbConfig: TypedLoadBalancingConfig,
+    options: ChannelOptions,
+    resolutionNote: string
+  ): boolean {
+    if (!(lbConfig instanceof RoundRobinLoadBalancingConfig)) {
+      return false;
+    }
+    if (!maybeEndpointList.ok) {
+      if (this.children.length === 0) {
+        this.updateState(
+          ConnectivityState.TRANSIENT_FAILURE,
+          new UnavailablePicker(maybeEndpointList.error),
+          maybeEndpointList.error.details
+        );
+      }
+      return true;
+    }
+    const startIndex = (Math.random() * maybeEndpointList.value.length) | 0;
+    const endpointList = rotateArray(maybeEndpointList.value, startIndex);
     this.resetSubchannelList();
+    if (endpointList.length === 0) {
+      const errorMessage = `No addresses resolved. Resolution note: ${resolutionNote}`;
+      this.updateState(
+        ConnectivityState.TRANSIENT_FAILURE,
+        new UnavailablePicker({details: errorMessage}),
+        errorMessage
+      );
+    }
     trace('Connect to endpoint list ' + endpointList.map(endpointToString));
     this.updatesPaused = true;
     this.children = endpointList.map(
@@ -207,7 +250,8 @@ export class RoundRobinLoadBalancer implements LoadBalancer {
         new LeafLoadBalancer(
           endpoint,
           this.childChannelControlHelper,
-          this.options
+          options,
+          resolutionNote
         )
     );
     for (const child of this.children) {
@@ -215,6 +259,7 @@ export class RoundRobinLoadBalancer implements LoadBalancer {
     }
     this.updatesPaused = false;
     this.calculateAndUpdateState();
+    return true;
   }
 
   exitIdle(): void {

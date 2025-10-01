@@ -31,6 +31,7 @@ import * as adsTypes from '../src/generated/ads';
 import * as lrsTypes from '../src/generated/lrs';
 import { LoadStatsRequest__Output } from "../src/generated/envoy/service/load_stats/v3/LoadStatsRequest";
 import { LoadStatsResponse } from "../src/generated/envoy/service/load_stats/v3/LoadStatsResponse";
+import * as path from 'path';
 
 const TRACER_NAME = 'control_plane_server';
 
@@ -52,7 +53,11 @@ const loadedProtos = loadPackageDefinition(loadSync(
     'envoy/extensions/load_balancing_policies/wrr_locality/v3/wrr_locality.proto',
     'envoy/extensions/load_balancing_policies/ring_hash/v3/ring_hash.proto',
     'envoy/extensions/load_balancing_policies/pick_first/v3/pick_first.proto',
-    'xds/type/v3/typed_struct.proto'
+    'envoy/extensions/load_balancing_policies/client_side_weighted_round_robin/v3/client_side_weighted_round_robin.proto',
+    'envoy/extensions/transport_sockets/tls/v3/tls.proto',
+    'xds/type/v3/typed_struct.proto',
+    'envoy/extensions/filters/http/router/v3/router.proto',
+    'envoy/extensions/filters/http/rbac/v3/rbac.proto'
   ],
   {
     keepCase: true,
@@ -367,7 +372,18 @@ export class ControlPlaneServer {
         id: 'test',
         locality: {}
       },
-      server_listener_resource_name_template: '%s'
+      server_listener_resource_name_template: '%s',
+      certificate_providers: {
+        test_certificates: {
+          plugin_name: 'file_watcher',
+          config: {
+            certificate_file: path.join(__dirname, 'fixtures', 'server1.pem'),
+            private_key_file: path.join(__dirname, 'fixtures', 'server1.key'),
+            ca_certificate_file: path.join(__dirname, 'fixtures', 'ca.pem'),
+            refresh_interval: '60s'
+          }
+        }
+      }
     }
     return JSON.stringify(bootstrapInfo);
   }

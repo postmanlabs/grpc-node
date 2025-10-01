@@ -43,6 +43,7 @@ import {
 } from './subchannel-interface';
 import * as logging from './logging';
 import { LoadBalancingConfig } from './service-config';
+import { StatusOr } from './call-interface';
 
 const TRACER_NAME = 'outlier_detection';
 
@@ -427,13 +428,13 @@ class OutlierDetectionPicker implements Picker {
       if (mapEntry) {
         let onCallEnded = wrappedPick.onCallEnded;
         if (this.countCalls) {
-          onCallEnded = statusCode => {
+          onCallEnded = (statusCode, details, metadata) => {
             if (statusCode === Status.OK) {
               mapEntry.counter.addSuccess();
             } else {
               mapEntry.counter.addFailure();
             }
-            wrappedPick.onCallEnded?.(statusCode);
+            wrappedPick.onCallEnded?.(statusCode, details, metadata);
           };
         }
         return {
@@ -468,8 +469,7 @@ export class OutlierDetectionLoadBalancer implements LoadBalancer {
   private timerStartTime: Date | null = null;
 
   constructor(
-    channelControlHelper: ChannelControlHelper,
-    options: ChannelOptions
+    channelControlHelper: ChannelControlHelper
   ) {
     this.childBalancer = new ChildLoadBalancerHandler(
       createChildChannelControlHelper(channelControlHelper, {
@@ -494,18 +494,18 @@ export class OutlierDetectionLoadBalancer implements LoadBalancer {
           mapEntry?.subchannelWrappers.push(subchannelWrapper);
           return subchannelWrapper;
         },
-        updateState: (connectivityState: ConnectivityState, picker: Picker) => {
+        updateState: (connectivityState: ConnectivityState, picker: Picker, errorMessage: string) => {
           if (connectivityState === ConnectivityState.READY) {
             channelControlHelper.updateState(
               connectivityState,
-              new OutlierDetectionPicker(picker, this.isCountingEnabled())
+              new OutlierDetectionPicker(picker, this.isCountingEnabled()),
+              errorMessage
             );
           } else {
-            channelControlHelper.updateState(connectivityState, picker);
+            channelControlHelper.updateState(connectivityState, picker, errorMessage);
           }
         },
-      }),
-      options
+      })
     );
     this.ejectionTimer = setInterval(() => {}, 0);
     clearInterval(this.ejectionTimer);
@@ -758,27 +758,31 @@ export class OutlierDetectionLoadBalancer implements LoadBalancer {
   }
 
   updateAddressList(
-    endpointList: Endpoint[],
+    endpointList: StatusOr<Endpoint[]>,
     lbConfig: TypedLoadBalancingConfig,
-    attributes: { [key: string]: unknown }
-  ): void {
+    options: ChannelOptions,
+    resolutionNote: string
+  ): boolean {
     if (!(lbConfig instanceof OutlierDetectionLoadBalancingConfig)) {
-      return;
+      return false;
     }
-    for (const endpoint of endpointList) {
-      if (!this.entryMap.has(endpoint)) {
-        trace('Adding map entry for ' + endpointToString(endpoint));
-        this.entryMap.set(endpoint, {
-          counter: new CallCounter(),
-          currentEjectionTimestamp: null,
-          ejectionTimeMultiplier: 0,
-          subchannelWrappers: [],
-        });
+    trace('Received update with config: ' + JSON.stringify(lbConfig.toJsonObject(), undefined, 2));
+    if (endpointList.ok) {
+      for (const endpoint of endpointList.value) {
+        if (!this.entryMap.has(endpoint)) {
+          trace('Adding map entry for ' + endpointToString(endpoint));
+          this.entryMap.set(endpoint, {
+            counter: new CallCounter(),
+            currentEjectionTimestamp: null,
+            ejectionTimeMultiplier: 0,
+            subchannelWrappers: [],
+          });
+        }
       }
+      this.entryMap.deleteMissing(endpointList.value);
     }
-    this.entryMap.deleteMissing(endpointList);
     const childPolicy = lbConfig.getChildPolicy();
-    this.childBalancer.updateAddressList(endpointList, childPolicy, attributes);
+    this.childBalancer.updateAddressList(endpointList, childPolicy, options, resolutionNote);
 
     if (
       lbConfig.getSuccessRateEjectionConfig() ||
@@ -808,6 +812,7 @@ export class OutlierDetectionLoadBalancer implements LoadBalancer {
     }
 
     this.latestConfig = lbConfig;
+    return true;
   }
   exitIdle(): void {
     this.childBalancer.exitIdle();

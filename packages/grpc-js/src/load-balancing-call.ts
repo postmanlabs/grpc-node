@@ -29,12 +29,13 @@ import { LogVerbosity, Status } from './constants';
 import { Deadline, formatDateDifference, getDeadlineTimeoutString } from './deadline';
 import { InternalChannel } from './internal-channel';
 import { Metadata } from './metadata';
-import { PickResultType } from './picker';
+import { OnCallEnded, PickResultType } from './picker';
 import { CallConfig } from './resolver';
 import { splitHostPort } from './uri-parser';
 import * as logging from './logging';
 import { restrictControlPlaneStatusCode } from './control-plane-status';
 import * as http2 from 'http2';
+import { AuthContext } from './auth-context';
 
 const TRACER_NAME = 'load_balancing_call';
 
@@ -59,7 +60,7 @@ export class LoadBalancingCall implements Call, DeadlineInfoProvider {
   private serviceUrl: string;
   private metadata: Metadata | null = null;
   private listener: InterceptingListener | null = null;
-  private onCallEnded: ((statusCode: Status) => void) | null = null;
+  private onCallEnded: OnCallEnded | null = null;
   private startTime: Date;
   private childStartTime: Date | null = null;
   constructor(
@@ -126,7 +127,7 @@ export class LoadBalancingCall implements Call, DeadlineInfoProvider {
       );
       const finalStatus = { ...status, progress };
       this.listener?.onReceiveStatus(finalStatus);
-      this.onCallEnded?.(finalStatus.code);
+      this.onCallEnded?.(finalStatus.code, finalStatus.details, finalStatus.metadata);
     }
   }
 
@@ -161,8 +162,9 @@ export class LoadBalancingCall implements Call, DeadlineInfoProvider {
     );
     switch (pickResult.pickResultType) {
       case PickResultType.COMPLETE:
-        this.credentials
-          .generateMetadata({ service_url: this.serviceUrl })
+        const combinedCallCredentials = this.credentials.compose(pickResult.subchannel!.getCallCredentials());
+        combinedCallCredentials
+          .generateMetadata({ method_name: this.methodName, service_url: this.serviceUrl })
           .then(
             credsMetadata => {
               /* If this call was cancelled (e.g. by the deadline) before
@@ -253,7 +255,6 @@ export class LoadBalancingCall implements Call, DeadlineInfoProvider {
                 );
                 return;
               }
-              this.callConfig.onCommitted?.();
               pickResult.onCallStarted?.();
               this.onCallEnded = pickResult.onCallEnded;
               this.trace(
@@ -374,5 +375,13 @@ export class LoadBalancingCall implements Call, DeadlineInfoProvider {
 
   getCallNumber(): number {
     return this.callNumber;
+  }
+
+  getAuthContext(): AuthContext | null {
+    if (this.child) {
+      return this.child.getAuthContext();
+    } else {
+      return null;
+    }
   }
 }

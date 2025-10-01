@@ -27,10 +27,11 @@ import { ConnectivityState } from './connectivity-state';
 import { Picker } from './picker';
 import type { ChannelRef, SubchannelRef } from './channelz';
 import { SubchannelInterface } from './subchannel-interface';
+import { StatusOr } from './call-interface';
 
 const TYPE_NAME = 'child_load_balancer_helper';
 
-export class ChildLoadBalancerHandler implements LoadBalancer {
+export class ChildLoadBalancerHandler {
   private currentChild: LoadBalancer | null = null;
   private pendingChild: LoadBalancer | null = null;
   private latestConfig: TypedLoadBalancingConfig | null = null;
@@ -47,7 +48,7 @@ export class ChildLoadBalancerHandler implements LoadBalancer {
         subchannelArgs
       );
     }
-    updateState(connectivityState: ConnectivityState, picker: Picker): void {
+    updateState(connectivityState: ConnectivityState, picker: Picker, errorMessage: string | null): void {
       if (this.calledByPendingChild()) {
         if (connectivityState === ConnectivityState.CONNECTING) {
           return;
@@ -58,7 +59,7 @@ export class ChildLoadBalancerHandler implements LoadBalancer {
       } else if (!this.calledByCurrentChild()) {
         return;
       }
-      this.parent.channelControlHelper.updateState(connectivityState, picker);
+      this.parent.channelControlHelper.updateState(connectivityState, picker, errorMessage);
     }
     requestReresolution(): void {
       const latestChild = this.parent.pendingChild ?? this.parent.currentChild;
@@ -85,8 +86,7 @@ export class ChildLoadBalancerHandler implements LoadBalancer {
   };
 
   constructor(
-    private readonly channelControlHelper: ChannelControlHelper,
-    private readonly options: ChannelOptions
+    private readonly channelControlHelper: ChannelControlHelper
   ) {}
 
   protected configUpdateRequiresNewPolicyInstance(
@@ -103,10 +103,11 @@ export class ChildLoadBalancerHandler implements LoadBalancer {
    * @param attributes
    */
   updateAddressList(
-    endpointList: Endpoint[],
+    endpointList: StatusOr<Endpoint[]>,
     lbConfig: TypedLoadBalancingConfig,
-    attributes: { [key: string]: unknown }
-  ): void {
+    options: ChannelOptions,
+    resolutionNote: string
+  ): boolean {
     let childToUpdate: LoadBalancer;
     if (
       this.currentChild === null ||
@@ -114,7 +115,7 @@ export class ChildLoadBalancerHandler implements LoadBalancer {
       this.configUpdateRequiresNewPolicyInstance(this.latestConfig, lbConfig)
     ) {
       const newHelper = new this.ChildPolicyHelper(this);
-      const newChild = createLoadBalancer(lbConfig, newHelper, this.options)!;
+      const newChild = createLoadBalancer(lbConfig, newHelper)!;
       newHelper.setChild(newChild);
       if (this.currentChild === null) {
         this.currentChild = newChild;
@@ -134,7 +135,7 @@ export class ChildLoadBalancerHandler implements LoadBalancer {
       }
     }
     this.latestConfig = lbConfig;
-    childToUpdate.updateAddressList(endpointList, lbConfig, attributes);
+    return childToUpdate.updateAddressList(endpointList, lbConfig, options, resolutionNote);
   }
   exitIdle(): void {
     if (this.currentChild) {

@@ -16,10 +16,11 @@
  */
 
 import { Any__Output } from "../generated/google/protobuf/Any";
-import { XdsServerConfig } from "../xds-bootstrap";
+import { BootstrapInfo, XdsServerConfig } from "../xds-bootstrap";
 
 export interface XdsDecodeContext {
   server: XdsServerConfig;
+  bootstrap: BootstrapInfo;
 }
 
 export interface XdsDecodeResult {
@@ -67,6 +68,18 @@ function deepEqual(value1: ValueType, value2: ValueType): boolean {
   }
   return false;
 }
+
+export interface ValidationSuccess<T> {
+  valid: true;
+  result: T;
+}
+
+export interface ValidationFailure {
+  valid: false;
+  errors: string[]
+}
+
+export type ValidationResult<T> = ValidationSuccess<T> | ValidationFailure;
 
 export abstract class XdsResourceType {
   /**

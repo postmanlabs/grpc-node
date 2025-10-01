@@ -43,6 +43,7 @@ import {
 import { isTcpSubchannelAddress } from './subchannel-address';
 import { isIPv6 } from 'net';
 import { ChannelOptions } from './channel-options';
+import { StatusOr, statusOrFromValue } from './call-interface';
 
 const TRACER_NAME = 'pick_first';
 
@@ -138,6 +139,9 @@ export function shuffled<T>(list: T[]): T[] {
 function interleaveAddressFamilies(
   addressList: SubchannelAddress[]
 ): SubchannelAddress[] {
+  if (addressList.length === 0) {
+    return [];
+  }
   const result: SubchannelAddress[] = [];
   const ipv6Addresses: SubchannelAddress[] = [];
   const ipv4Addresses: SubchannelAddress[] = [];
@@ -213,8 +217,6 @@ export class PickFirstLoadBalancer implements LoadBalancer {
    */
   private connectionDelayTimeout: NodeJS.Timeout;
 
-  private triedAllSubchannels = false;
-
   /**
    * The LB policy enters sticky TRANSIENT_FAILURE mode when all
    * subchannels have failed to connect at least once, and it stays in that
@@ -223,13 +225,7 @@ export class PickFirstLoadBalancer implements LoadBalancer {
    */
   private stickyTransientFailureMode = false;
 
-  private reportHealthStatus: boolean;
-
-  /**
-   * Indicates whether we called channelControlHelper.requestReresolution since
-   * the last call to updateAddressList
-   */
-  private requestedResolutionSinceLastUpdate = false;
+  private reportHealthStatus: boolean = false;
 
   /**
    * The most recent error reported by any subchannel as it transitioned to
@@ -239,6 +235,10 @@ export class PickFirstLoadBalancer implements LoadBalancer {
 
   private latestAddressList: SubchannelAddress[] | null = null;
 
+  private latestOptions: ChannelOptions = {};
+
+  private latestResolutionNote: string = '';
+
   /**
    * Load balancer that attempts to connect to each backend in the address list
    * in order, and picks the first one that connects, using it for every
@@ -247,51 +247,66 @@ export class PickFirstLoadBalancer implements LoadBalancer {
    *     this load balancer's owner.
    */
   constructor(
-    private readonly channelControlHelper: ChannelControlHelper,
-    options: ChannelOptions
+    private readonly channelControlHelper: ChannelControlHelper
   ) {
     this.connectionDelayTimeout = setTimeout(() => {}, 0);
     clearTimeout(this.connectionDelayTimeout);
-    this.reportHealthStatus = options[REPORT_HEALTH_STATUS_OPTION_NAME];
   }
 
   private allChildrenHaveReportedTF(): boolean {
     return this.children.every(child => child.hasReportedTransientFailure);
   }
 
+  private resetChildrenReportedTF() {
+    this.children.every(child => child.hasReportedTransientFailure = false);
+  }
+
   private calculateAndReportNewState() {
     if (this.currentPick) {
       if (this.reportHealthStatus && !this.currentPick.isHealthy()) {
+        const errorMessage = `Picked subchannel ${this.currentPick.getAddress()} is unhealthy`;
         this.updateState(
           ConnectivityState.TRANSIENT_FAILURE,
           new UnavailablePicker({
-            details: `Picked subchannel ${this.currentPick.getAddress()} is unhealthy`,
-          })
+            details: errorMessage,
+          }),
+          errorMessage
         );
       } else {
         this.updateState(
           ConnectivityState.READY,
-          new PickFirstPicker(this.currentPick)
+          new PickFirstPicker(this.currentPick),
+          null
         );
       }
+    } else if (this.latestAddressList?.length === 0) {
+      const errorMessage = `No connection established. Last error: ${this.lastError}. Resolution note: ${this.latestResolutionNote}`;
+      this.updateState(
+        ConnectivityState.TRANSIENT_FAILURE,
+        new UnavailablePicker({
+          details: errorMessage,
+        }),
+        errorMessage
+      );
     } else if (this.children.length === 0) {
-      this.updateState(ConnectivityState.IDLE, new QueuePicker(this));
+      this.updateState(ConnectivityState.IDLE, new QueuePicker(this), null);
     } else {
       if (this.stickyTransientFailureMode) {
+        const errorMessage = `No connection established. Last error: ${this.lastError}. Resolution note: ${this.latestResolutionNote}`;
         this.updateState(
           ConnectivityState.TRANSIENT_FAILURE,
           new UnavailablePicker({
-            details: `No connection established. Last error: ${this.lastError}`,
-          })
+            details: errorMessage,
+          }),
+          errorMessage
         );
       } else {
-        this.updateState(ConnectivityState.CONNECTING, new QueuePicker(this));
+        this.updateState(ConnectivityState.CONNECTING, new QueuePicker(this), null);
       }
     }
   }
 
   private requestReresolution() {
-    this.requestedResolutionSinceLastUpdate = true;
     this.channelControlHelper.requestReresolution();
   }
 
@@ -299,16 +314,10 @@ export class PickFirstLoadBalancer implements LoadBalancer {
     if (!this.allChildrenHaveReportedTF()) {
       return;
     }
-    if (!this.requestedResolutionSinceLastUpdate) {
-      /* Each time we get an update we reset each subchannel's
-       * hasReportedTransientFailure flag, so the next time we get to this
-       * point after that, each subchannel has reported TRANSIENT_FAILURE
-       * at least once since then. That is the trigger for requesting
-       * reresolution, whether or not the LB policy is already in sticky TF
-       * mode. */
-      this.requestReresolution();
-    }
+    this.requestReresolution();
+    this.resetChildrenReportedTF();
     if (this.stickyTransientFailureMode) {
+      this.calculateAndReportNewState();
       return;
     }
     this.stickyTransientFailureMode = true;
@@ -320,21 +329,16 @@ export class PickFirstLoadBalancer implements LoadBalancer {
 
   private removeCurrentPick() {
     if (this.currentPick !== null) {
-      /* Unref can cause a state change, which can cause a change in the value
-       * of this.currentPick, so we hold a local reference to make sure that
-       * does not impact this function. */
-      const currentPick = this.currentPick;
-      this.currentPick = null;
-      currentPick.unref();
-      currentPick.removeConnectivityStateListener(this.subchannelStateListener);
+      this.currentPick.removeConnectivityStateListener(this.subchannelStateListener);
       this.channelControlHelper.removeChannelzChild(
-        currentPick.getChannelzRef()
+        this.currentPick.getChannelzRef()
       );
-      if (this.reportHealthStatus) {
-        currentPick.removeHealthStateWatcher(
-          this.pickedSubchannelHealthListener
-        );
-      }
+      this.currentPick.removeHealthStateWatcher(
+        this.pickedSubchannelHealthListener
+      );
+      // Unref last, to avoid triggering listeners
+      this.currentPick.unref();
+      this.currentPick = null;
     }
   }
 
@@ -374,9 +378,6 @@ export class PickFirstLoadBalancer implements LoadBalancer {
 
   private startNextSubchannelConnecting(startIndex: number) {
     clearTimeout(this.connectionDelayTimeout);
-    if (this.triedAllSubchannels) {
-      return;
-    }
     for (const [index, child] of this.children.entries()) {
       if (index >= startIndex) {
         const subchannelState = child.subchannel.getConnectivityState();
@@ -389,7 +390,6 @@ export class PickFirstLoadBalancer implements LoadBalancer {
         }
       }
     }
-    this.triedAllSubchannels = true;
     this.maybeEnterStickyTransientFailureMode();
   }
 
@@ -418,50 +418,46 @@ export class PickFirstLoadBalancer implements LoadBalancer {
     this.connectionDelayTimeout.unref?.();
   }
 
+  /**
+   * Declare that the specified subchannel should be used to make requests.
+   * This functions the same independent of whether subchannel is a member of
+   * this.children and whether it is equal to this.currentPick.
+   * Prerequisite: subchannel.getConnectivityState() === READY.
+   * @param subchannel
+   */
   private pickSubchannel(subchannel: SubchannelInterface) {
-    if (this.currentPick && subchannel.realSubchannelEquals(this.currentPick)) {
-      return;
-    }
     trace('Pick subchannel with address ' + subchannel.getAddress());
     this.stickyTransientFailureMode = false;
-    this.removeCurrentPick();
-    this.currentPick = subchannel;
+    /* Ref before removeCurrentPick and resetSubchannelList to avoid the
+     * refcount dropping to 0 during this process. */
     subchannel.ref();
-    if (this.reportHealthStatus) {
-      subchannel.addHealthStateWatcher(this.pickedSubchannelHealthListener);
-    }
     this.channelControlHelper.addChannelzChild(subchannel.getChannelzRef());
+    this.removeCurrentPick();
     this.resetSubchannelList();
+    subchannel.addConnectivityStateListener(this.subchannelStateListener);
+    subchannel.addHealthStateWatcher(this.pickedSubchannelHealthListener);
+    this.currentPick = subchannel;
     clearTimeout(this.connectionDelayTimeout);
     this.calculateAndReportNewState();
   }
 
-  private updateState(newState: ConnectivityState, picker: Picker) {
+  private updateState(newState: ConnectivityState, picker: Picker, errorMessage: string | null) {
     trace(
       ConnectivityState[this.currentState] +
         ' -> ' +
         ConnectivityState[newState]
     );
     this.currentState = newState;
-    this.channelControlHelper.updateState(newState, picker);
+    this.channelControlHelper.updateState(newState, picker, errorMessage);
   }
 
   private resetSubchannelList() {
     for (const child of this.children) {
-      if (
-        !(
-          this.currentPick &&
-          child.subchannel.realSubchannelEquals(this.currentPick)
-        )
-      ) {
-        /* The connectivity state listener is the same whether the subchannel
-         * is in the list of children or it is the currentPick, so if it is in
-         * both, removing it here would cause problems. In particular, that
-         * always happens immediately after the subchannel is picked. */
-        child.subchannel.removeConnectivityStateListener(
-          this.subchannelStateListener
-        );
-      }
+      /* Always remoev the connectivity state listener. If the subchannel is
+         getting picked, it will be re-added then. */
+      child.subchannel.removeConnectivityStateListener(
+        this.subchannelStateListener
+      );
       /* Refs are counted independently for the children list and the
        * currentPick, so we call unref whether or not the child is the
        * currentPick. Channelz child references are also refcounted, so
@@ -473,20 +469,16 @@ export class PickFirstLoadBalancer implements LoadBalancer {
     }
     this.currentSubchannelIndex = 0;
     this.children = [];
-    this.triedAllSubchannels = false;
-    this.requestedResolutionSinceLastUpdate = false;
   }
 
-  private connectToAddressList(addressList: SubchannelAddress[]) {
+  private connectToAddressList(addressList: SubchannelAddress[], options: ChannelOptions) {
+    trace('connectToAddressList([' + addressList.map(address => subchannelAddressToString(address)) + '])');
     const newChildrenList = addressList.map(address => ({
-      subchannel: this.channelControlHelper.createSubchannel(address, {}),
+      subchannel: this.channelControlHelper.createSubchannel(address, options),
       hasReportedTransientFailure: false,
     }));
-    trace('connectToAddressList([' + addressList.map(address => subchannelAddressToString(address)) + '])');
     for (const { subchannel } of newChildrenList) {
       if (subchannel.getConnectivityState() === ConnectivityState.READY) {
-        this.channelControlHelper.addChannelzChild(subchannel.getChannelzRef());
-        subchannel.addConnectivityStateListener(this.subchannelStateListener);
         this.pickSubchannel(subchannel);
         return;
       }
@@ -516,12 +508,26 @@ export class PickFirstLoadBalancer implements LoadBalancer {
   }
 
   updateAddressList(
-    endpointList: Endpoint[],
-    lbConfig: TypedLoadBalancingConfig
-  ): void {
+    maybeEndpointList: StatusOr<Endpoint[]>,
+    lbConfig: TypedLoadBalancingConfig,
+    options: ChannelOptions,
+    resolutionNote: string
+  ): boolean {
     if (!(lbConfig instanceof PickFirstLoadBalancingConfig)) {
-      return;
+      return false;
     }
+    if (!maybeEndpointList.ok) {
+      if (this.children.length === 0 && this.currentPick === null) {
+        this.channelControlHelper.updateState(
+          ConnectivityState.TRANSIENT_FAILURE,
+          new UnavailablePicker(maybeEndpointList.error),
+          maybeEndpointList.error.details
+        );
+      }
+      return true;
+    }
+    let endpointList = maybeEndpointList.value;
+    this.reportHealthStatus = options[REPORT_HEALTH_STATUS_OPTION_NAME];
     /* Previously, an update would be discarded if it was identical to the
      * previous update, to minimize churn. Now the DNS resolver is
      * rate-limited, so that is less of a concern. */
@@ -532,12 +538,17 @@ export class PickFirstLoadBalancer implements LoadBalancer {
       ...endpointList.map(endpoint => endpoint.addresses)
     );
     trace('updateAddressList([' + rawAddressList.map(address => subchannelAddressToString(address)) + '])');
-    if (rawAddressList.length === 0) {
-      throw new Error('No addresses in endpoint list passed to pick_first');
-    }
     const addressList = interleaveAddressFamilies(rawAddressList);
     this.latestAddressList = addressList;
-    this.connectToAddressList(addressList);
+    this.latestOptions = options;
+    this.connectToAddressList(addressList, options);
+    this.latestResolutionNote = resolutionNote;
+    if (rawAddressList.length > 0) {
+      return true;
+    } else {
+      this.lastError = 'No addresses resolved';
+      return false;
+    }
   }
 
   exitIdle() {
@@ -545,7 +556,7 @@ export class PickFirstLoadBalancer implements LoadBalancer {
       this.currentState === ConnectivityState.IDLE &&
       this.latestAddressList
     ) {
-      this.connectToAddressList(this.latestAddressList);
+      this.connectToAddressList(this.latestAddressList, this.latestOptions);
     }
   }
 
@@ -578,27 +589,32 @@ export class LeafLoadBalancer {
   constructor(
     private endpoint: Endpoint,
     channelControlHelper: ChannelControlHelper,
-    options: ChannelOptions
+    private options: ChannelOptions,
+    private resolutionNote: string
   ) {
     const childChannelControlHelper = createChildChannelControlHelper(
       channelControlHelper,
       {
-        updateState: (connectivityState, picker) => {
+        updateState: (connectivityState, picker, errorMessage) => {
           this.latestState = connectivityState;
           this.latestPicker = picker;
-          channelControlHelper.updateState(connectivityState, picker);
+          channelControlHelper.updateState(connectivityState, picker, errorMessage);
         },
       }
     );
     this.pickFirstBalancer = new PickFirstLoadBalancer(
-      childChannelControlHelper,
-      { ...options, [REPORT_HEALTH_STATUS_OPTION_NAME]: true }
+      childChannelControlHelper
     );
     this.latestPicker = new QueuePicker(this.pickFirstBalancer);
   }
 
   startConnecting() {
-    this.pickFirstBalancer.updateAddressList([this.endpoint], LEAF_CONFIG);
+    this.pickFirstBalancer.updateAddressList(
+      statusOrFromValue([this.endpoint]),
+      LEAF_CONFIG,
+      { ...this.options, [REPORT_HEALTH_STATUS_OPTION_NAME]: true },
+      this.resolutionNote
+    );
   }
 
   /**
@@ -607,7 +623,8 @@ export class LeafLoadBalancer {
    * attempt is not already in progress.
    * @param newEndpoint
    */
-  updateEndpoint(newEndpoint: Endpoint) {
+  updateEndpoint(newEndpoint: Endpoint, newOptions: ChannelOptions) {
+    this.options = newOptions;
     this.endpoint = newEndpoint;
     if (this.latestState !== ConnectivityState.IDLE) {
       this.startConnecting();

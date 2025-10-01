@@ -15,7 +15,7 @@
  *
  */
 
-import { ChannelOptions, credentials, loadPackageDefinition, ServiceError } from "@grpc/grpc-js";
+import { ChannelCredentials, ChannelOptions, credentials, loadPackageDefinition, Metadata, ServiceError } from "@grpc/grpc-js";
 import { loadSync } from "@grpc/proto-loader";
 import { ProtoGrpcType } from "./generated/echo";
 import { EchoTestServiceClient } from "./generated/grpc/testing/EchoTestService";
@@ -42,16 +42,16 @@ const BOOTSTRAP_CONFIG_KEY = 'grpc.TEST_ONLY_DO_NOT_USE_IN_PROD.xds_bootstrap_co
 
 export class XdsTestClient {
   private client: EchoTestServiceClient;
-  private callInterval: NodeJS.Timer;
+  private callInterval: NodeJS.Timeout;
 
-  constructor(target: string, bootstrapInfo: string, options?: ChannelOptions) {
-    this.client = new loadedProtos.grpc.testing.EchoTestService(target, credentials.createInsecure(), {...options, [BOOTSTRAP_CONFIG_KEY]: bootstrapInfo});
+  constructor(target: string, bootstrapInfo: string, creds?: ChannelCredentials | undefined, options?: ChannelOptions) {
+    this.client = new loadedProtos.grpc.testing.EchoTestService(target, creds ?? credentials.createInsecure(), {...options, [BOOTSTRAP_CONFIG_KEY]: bootstrapInfo});
     this.callInterval = setInterval(() => {}, 0);
     clearInterval(this.callInterval);
   }
 
-  static createFromServer(targetName: string, xdsServer: ControlPlaneServer, options?: ChannelOptions) {
-    return new XdsTestClient(`xds:///${targetName}`, xdsServer.getBootstrapInfoString(), options);
+  static createFromServer(targetName: string, xdsServer: ControlPlaneServer, creds?: ChannelCredentials | undefined, options?: ChannelOptions) {
+    return new XdsTestClient(`xds:///${targetName}`, xdsServer.getBootstrapInfoString(), creds, options);
   }
 
   startCalls(interval: number) {
@@ -76,7 +76,7 @@ export class XdsTestClient {
 
   sendOneCall(callback: (error: ServiceError | null) => void) {
     const deadline = new Date();
-    deadline.setMilliseconds(deadline.getMilliseconds() + 500);
+    deadline.setMilliseconds(deadline.getMilliseconds() + 1500);
     this.client.echo({message: 'test'}, {deadline}, (error, value) => {
       callback(error);
     });
