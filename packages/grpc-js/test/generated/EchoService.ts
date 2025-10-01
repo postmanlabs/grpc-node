@@ -1,7 +1,7 @@
 // Original file: test/fixtures/echo_service.proto
 
 import type * as grpc from './../../src/index'
-import type { MethodDefinition } from '@grpc/proto-loader'
+import type { MethodDefinition } from '@postman/proto-loader'
 import type { EchoMessage as _EchoMessage, EchoMessage__Output as _EchoMessage__Output } from './EchoMessage';
 
 export interface EchoServiceClient extends grpc.Client {

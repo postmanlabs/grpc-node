@@ -1,6 +1,6 @@
 // Original file: proto/protoc-gen-validate/validate/validate.proto
 
-import type { Long } from '@grpc/proto-loader';
+import type { Long } from '@postman/proto-loader';
 
 /**
  * SFixed64Rules describes the constraints applied to `sfixed64` values

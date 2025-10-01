@@ -1,5 +1,5 @@
 import type * as grpc from '../index';
-import type { EnumTypeDefinition, MessageTypeDefinition } from '@grpc/proto-loader';
+import type { EnumTypeDefinition, MessageTypeDefinition } from '@postman/proto-loader';
 
 import type { DescriptorProto as _google_protobuf_DescriptorProto, DescriptorProto__Output as _google_protobuf_DescriptorProto__Output } from './google/protobuf/DescriptorProto';
 import type { Duration as _google_protobuf_Duration, Duration__Output as _google_protobuf_Duration__Output } from './google/protobuf/Duration';

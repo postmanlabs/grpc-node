@@ -1,7 +1,7 @@
 // Original file: proto/protoc-gen-validate/validate/validate.proto
 
 import type { FieldRules as _validate_FieldRules, FieldRules__Output as _validate_FieldRules__Output } from '../validate/FieldRules';
-import type { Long } from '@grpc/proto-loader';
+import type { Long } from '@postman/proto-loader';
 
 /**
  * MapRules describe the constraints applied to `map` values

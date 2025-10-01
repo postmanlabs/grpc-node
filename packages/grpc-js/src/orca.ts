@@ -17,7 +17,7 @@
 
 import { OrcaLoadReport, OrcaLoadReport__Output } from "./generated/xds/data/orca/v3/OrcaLoadReport";
 
-import type { loadSync } from '@grpc/proto-loader';
+import type { loadSync } from '@postman/proto-loader';
 import { ProtoGrpcType as OrcaProtoGrpcType } from "./generated/orca";
 import { loadPackageDefinition } from "./make-client";
 import { OpenRcaServiceClient, OpenRcaServiceHandlers } from "./generated/xds/service/orca/v3/OpenRcaService";

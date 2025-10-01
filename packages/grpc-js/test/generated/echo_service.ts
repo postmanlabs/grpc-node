@@ -1,5 +1,5 @@
 import type * as grpc from '../../src/index';
-import type { MessageTypeDefinition } from '@grpc/proto-loader';
+import type { MessageTypeDefinition } from '@postman/proto-loader';
 
 import type { EchoMessage as _EchoMessage, EchoMessage__Output as _EchoMessage__Output } from './EchoMessage';
 import type { EchoServiceClient as _EchoServiceClient, EchoServiceDefinition as _EchoServiceDefinition } from './EchoService';
