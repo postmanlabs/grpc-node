@@ -40,7 +40,7 @@ function loadOrcaProto(): OrcaProtoGrpcType {
   }
   /* The purpose of this complexity is to avoid loading @grpc/proto-loader at
    * runtime for users who will not use/enable ORCA. */
-  const loaderLoadSync = require('@grpc/proto-loader')
+  const loaderLoadSync = require('@postman/proto-loader')
     .loadSync as typeof loadSync;
   const loadedProto = loaderLoadSync('xds/service/orca/v3/orca.proto', {
     keepCase: true,
