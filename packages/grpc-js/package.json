@@ -68,7 +68,7 @@
     "copy-protos": "node ./copy-protos"
   },
   "dependencies": {
-    "@postman/proto-loader": "^0.8.0-postman.1",
+    "@postman/proto-loader": "^0.8.0-postman.2",
     "@js-sdsl/ordered-map": "^4.4.2"
   },
   "files": [
