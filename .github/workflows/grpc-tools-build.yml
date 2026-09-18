@@ -15,6 +15,7 @@ jobs:
   linux_build:
     name: Linux grpc-tools Build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v2
         with:
@@ -30,6 +31,7 @@ jobs:
   macos_build:
     name: Macos grpc-tools Build
     runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v2
         with:
@@ -43,6 +45,7 @@ jobs:
   windows_build:
     name: Windows grpc-tools Build
     runs-on: windows-latest
+    timeout-minutes: 14
     strategy:
       matrix:
         arch: [ia32, x64]
@@ -62,6 +65,7 @@ jobs:
   combine_artifacts:
     name: Combine grpc-tools artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: [linux_build, macos_build, windows_build]
     steps:
       - uses: actions/download-artifact@v4
