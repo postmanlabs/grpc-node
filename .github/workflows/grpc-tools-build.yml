@@ -18,6 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
         with:
+          persist-credentials: false
           submodules: recursive
       - name: Build
         run: |
@@ -33,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
         with:
+          persist-credentials: false
           submodules: recursive
       - name: Build
         run: packages/grpc-tools/build_binaries.sh
@@ -51,6 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
         with:
+          persist-credentials: false
           submodules: recursive
       - name: Build
         run: powershell -File ./packages/grpc-tools/build_binaries.ps1
